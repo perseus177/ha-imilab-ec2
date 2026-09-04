@@ -37,11 +37,8 @@ ACCOUNT_BASE = "https://account.xiaomi.com"
 STS_CALLBACK = "https://sts.api.io.mi.com/sts"
 JSON_GUARD = "&&&START&&&"
 SID = "xiaomiio"
-AGENT = (
-    "Android-7.1.1-1.0.0-ONEPLUS A3010-136-",
-    "APP/xiaomi.smarthome APPV/62830",
-)
 TIMEOUT = 20
+ACCOUNT_HEADERS_CT = "application/x-www-form-urlencoded"
 
 # Only these regions have their own API host. Everything else -- including
 # mainland China, and including an empty region -- lives on the bare host.
@@ -104,6 +101,7 @@ class XiaomiCloud:
         # retry makes the account look like a new device and the verification
         # the user just did counts for nothing.
         self._device_id = "".join(chr(97 + b % 26) for b in os.urandom(6))
+        self._agent = _generate_agent()
         self.user_id: str | None = None
         self.pass_token: str | None = None
         self.ssecurity: str | None = None
@@ -128,29 +126,32 @@ class XiaomiCloud:
     async def async_login(self, username: str, password: str) -> None:
         """Log in with a username and password.
 
-        Raises `TwoFactorRequired` when Xiaomi wants a code. Once the user has
-        completed verification in a browser, call this again on the SAME client
-        -- the device id and cookie jar have to match the attempt that was
-        challenged.
+        A faithful port of the sequence the Xiaomi Cloud Map Extractor uses,
+        because re-deriving it produced subtle differences that broke
+        two-factor accounts. In particular serviceLoginAuth2 takes its fields
+        in the QUERY STRING, not the request body.
+
+        Raises `TwoFactorRequired` when Xiaomi wants verification. Once the
+        user has completed it in a browser, call this again on the SAME client:
+        the sign, device id and cookie jar all have to match the attempt that
+        was challenged.
         """
         if self._sign is None:
             self._sign = await self._async_login_sign(username)
-        sign = self._sign
-        hashed = hashlib.md5(password.encode()).hexdigest().upper()
 
-        payload = {
+        fields = {
             "sid": SID,
-            "hash": hashed,
+            "hash": hashlib.md5(password.encode()).hexdigest().upper(),
             "callback": STS_CALLBACK,
             "qs": "%3Fsid%3Dxiaomiio%26_json%3Dtrue",
             "user": username,
             "_json": "true",
         }
-        if sign:
-            payload["_sign"] = sign
+        if self._sign:
+            fields["_sign"] = self._sign
 
-        data = await self._async_post_form(
-            f"{ACCOUNT_BASE}/pass/serviceLoginAuth2", payload
+        data = await self._async_request(
+            "POST", f"{ACCOUNT_BASE}/pass/serviceLoginAuth2", params=fields
         )
         try:
             await self._async_finish_login(data)
@@ -159,8 +160,6 @@ class XiaomiCloud:
             # to this context, and the retry has to come back to it.
             raise
         except XiaomiCloudError:
-            # Anything else (a wrong password, an expired sign) means the
-            # context is spent; start clean next time.
             self._sign = None
             raise
         self._sign = None
@@ -171,21 +170,20 @@ class XiaomiCloud:
         This is the same path go2rtc uses, and the reason a working setup keeps
         working without ever storing a password.
         """
-        cookies = {**self._base_cookies, "userId": user_id, "passToken": pass_token}
-        data = await self._async_get_json(
-            f"{ACCOUNT_BASE}/pass/serviceLogin?sid={SID}&_json=true", cookies=cookies
+        data = await self._async_request(
+            "GET",
+            f"{ACCOUNT_BASE}/pass/serviceLogin?sid={SID}&_json=true",
+            cookies={"userId": user_id, "passToken": pass_token},
         )
         await self._async_finish_login(data)
 
     async def _async_login_sign(self, username: str | None = None) -> str | None:
         """Fetch the `_sign` nonce that serviceLoginAuth2 wants."""
-        cookies = dict(self._base_cookies)
-        if username:
-            # Xiaomi's own SDK sends this; without it some accounts get a sign
-            # that the following POST then rejects.
-            cookies["userId"] = username
-        data = await self._async_get_json(
-            f"{ACCOUNT_BASE}/pass/serviceLogin?sid={SID}&_json=true", cookies=cookies
+        cookies = {"userId": username} if username else None
+        data = await self._async_request(
+            "GET",
+            f"{ACCOUNT_BASE}/pass/serviceLogin?sid={SID}&_json=true",
+            cookies=cookies,
         )
         return data.get("_sign")
 
@@ -295,7 +293,7 @@ class XiaomiCloud:
 
         url = api_host(region) + path
         headers = {
-            "User-Agent": "".join(AGENT),
+            "User-Agent": self._agent,
             "x-xiaomi-protocal-flag-cli": "PROTOCAL-HTTP2",
             "Content-Type": "application/x-www-form-urlencoded",
         }
@@ -325,45 +323,45 @@ class XiaomiCloud:
 
     # -- plumbing ------------------------------------------------------------
 
-    async def _async_get_json(
-        self, url: str, cookies: dict[str, str] | None = None
+    async def _async_request(
+        self,
+        method: str,
+        url: str,
+        params: dict[str, str] | None = None,
+        cookies: dict[str, str] | None = None,
     ) -> dict[str, Any]:
+        """One account-service call, returning the guarded JSON body.
+
+        Fields go in the query string for both verbs -- that is what Xiaomi's
+        account service expects, and sending them as a form body is what broke
+        two-factor logins here.
+        """
+        headers = {"User-Agent": self._agent, "Content-Type": ACCOUNT_HEADERS_CT}
+        jar = {**self._base_cookies, **(cookies or {})}
         try:
-            async with self._session.get(
+            async with self._session.request(
+                method,
                 url,
-                cookies=cookies,
-                headers={"User-Agent": "".join(AGENT)},
+                params=params,
+                headers=headers,
+                cookies=jar,
                 timeout=aiohttp.ClientTimeout(total=TIMEOUT),
             ) as response:
                 text = await response.text()
         except aiohttp.ClientError as err:
             raise XiaomiCloudError(f"{url}: {err}") from err
+
         parsed = _strip_guard(text)
         if not isinstance(parsed, dict):
-            raise XiaomiCloudError("unexpected login response")
+            raise XiaomiCloudError("unexpected response from the account service")
         return parsed
 
-    async def _async_post_form(
-        self, url: str, payload: dict[str, str]
-    ) -> dict[str, Any]:
-        try:
-            async with self._session.post(
-                url,
-                data=payload,
-                headers={
-                    "User-Agent": "".join(AGENT),
-                    "Content-Type": "application/x-www-form-urlencoded",
-                },
-                cookies=self._base_cookies,
-                timeout=aiohttp.ClientTimeout(total=TIMEOUT),
-            ) as response:
-                text = await response.text()
-        except aiohttp.ClientError as err:
-            raise XiaomiCloudError(f"{url}: {err}") from err
-        parsed = _strip_guard(text)
-        if not isinstance(parsed, dict):
-            raise XiaomiCloudError("unexpected login response")
-        return parsed
+
+def _generate_agent() -> str:
+    """The user agent shape Xiaomi's own account SDK sends."""
+    suffix = "".join(chr(65 + b % 5) for b in os.urandom(13))
+    prefix = "".join(chr(97 + b % 26) for b in os.urandom(18))
+    return f"{prefix}-{suffix} APP/com.xiaomi.mihome APPV/10.5.201"
 
 
 def _gen_nonce() -> str:

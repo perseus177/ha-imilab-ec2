@@ -103,6 +103,11 @@ class Ec2ConfigFlow(ConfigFlow, domain=DOMAIN):
             result = await self._async_login()
             if result is not None:
                 return result
+            if self._last_error == "two_factor_pending":
+                # Move on to the step that actually shows the verification
+                # link. Re-rendering this form instead would leave the user
+                # with an error and no way to act on it.
+                return await self.async_step_two_factor()
             errors["base"] = self._last_error
 
         return self.async_show_form(
