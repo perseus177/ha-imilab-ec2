@@ -139,13 +139,9 @@ class Ec2ConfigFlow(ConfigFlow, domain=DOMAIN):
             result = await self._async_login()
             if result is not None:
                 return result
-            if self._last_error == "captcha_required":
-                return await self.async_step_captcha()
-            if self._last_error == "two_factor_pending":
-                # Move on to the step that actually shows the verification
-                # link. Re-rendering this form instead would leave the user
-                # with an error and no way to act on it.
-                return await self.async_step_two_factor()
+            nxt = await self._async_next("credentials")
+            if nxt is not None:
+                return nxt
             errors["base"] = self._last_error
 
         return self.async_show_form(
@@ -193,8 +189,9 @@ class Ec2ConfigFlow(ConfigFlow, domain=DOMAIN):
             result = await self._async_login(user_input[CONF_CAPTCHA].strip())
             if result is not None:
                 return result
-            if self._last_error == "two_factor_pending":
-                return await self.async_step_two_factor()
+            nxt = await self._async_next("captcha")
+            if nxt is not None:
+                return nxt
             # A fresh captcha comes with every refusal; the old one is spent.
             errors["base"] = (
                 "captcha_wrong"
@@ -225,8 +222,9 @@ class Ec2ConfigFlow(ConfigFlow, domain=DOMAIN):
             result = await self._async_login()
             if result is not None:
                 return result
-            # Still refused. Say which of the two reasons it was, rather than
-            # silently redrawing the same dialog.
+            nxt = await self._async_next("two_factor")
+            if nxt is not None:
+                return nxt
             errors["base"] = self._last_error
 
         return self.async_show_form(
@@ -323,6 +321,23 @@ class Ec2ConfigFlow(ConfigFlow, domain=DOMAIN):
             ),
         )
 
+    async def _async_next(self, current: str) -> ConfigFlowResult | None:
+        """Route to whatever Xiaomi is asking for next.
+
+        A challenge can arrive in any order and more than once -- solving a
+        captcha often leads to a verification, and confirming that verification
+        can be met with a fresh captcha. Every step therefore defers here
+        instead of assuming what follows it; assuming was what left the user
+        stranded on a step that could not act on its own error.
+
+        Returns None only when the answer belongs on the calling step itself.
+        """
+        if self._last_error == "captcha_required" and current != "captcha":
+            return await self.async_step_captcha()
+        if self._last_error == "two_factor_pending" and current != "two_factor":
+            return await self.async_step_two_factor()
+        return None
+
     def _async_cloud(self) -> XiaomiCloud:
         """The one cloud client for this flow.
 
@@ -352,10 +367,14 @@ class Ec2ConfigFlow(ConfigFlow, domain=DOMAIN):
         try:
             await cloud.async_login(self._username, self._password, captcha_code)
         except CaptchaRequired as err:
+            # Logged because a challenge is not a failure, and silence here
+            # left nothing in the log to explain why sign-in kept looping.
+            _LOGGER.debug("Xiaomi issued a captcha")
             self._captcha_image = err.image_data_uri
             self._last_error = "captcha_required"
             return None
         except TwoFactorRequired as err:
+            _LOGGER.debug("Xiaomi wants verification at %s", err.notification_url)
             self._two_factor_url = err.notification_url
             self._last_error = "two_factor_pending"
             return None
