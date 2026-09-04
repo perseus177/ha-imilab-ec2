@@ -59,6 +59,23 @@ class XiaomiCloudError(Exception):
     """Login or an API call failed."""
 
 
+class CaptchaRequired(XiaomiCloudError):
+    """Xiaomi wants a captcha solved before it will accept the password.
+
+    Reported as code 87001. It typically appears after a few failed sign-in
+    attempts from the same address, and the Cloud Map Extractor does not handle
+    it at all -- there is no upstream implementation to copy here.
+
+    The image can only be fetched with the session that will submit the answer,
+    because Xiaomi ties it to an `ick` cookie, so it has to be shown to the user
+    rather than linked.
+    """
+
+    def __init__(self, image_data_uri: str) -> None:
+        super().__init__("captcha required")
+        self.image_data_uri = image_data_uri
+
+
 class TwoFactorRequired(XiaomiCloudError):
     """Xiaomi wants verification before it will finish the login."""
 
@@ -185,18 +202,27 @@ class XiaomiCloud:
         # Cached from the challenged attempt and reused on retry: the
         # verification URL is bound to the login context this identifies.
         self._sign: str | None = None
+        # Set when a captcha is issued; the answer is only valid alongside it.
+        self._ick: str | None = None
 
     @property
     def _account_cookies(self) -> dict[str, str]:
-        return {"sdkVersion": "accountsdk-18.8.15", "deviceId": self._device_id}
+        cookies = {"sdkVersion": "accountsdk-18.8.15", "deviceId": self._device_id}
+        if self._ick:
+            cookies["ick"] = self._ick
+        return cookies
 
     # -- login ---------------------------------------------------------------
 
-    async def async_login(self, username: str, password: str) -> None:
+    async def async_login(
+        self, username: str, password: str, captcha_code: str | None = None
+    ) -> None:
         """Log in with a username and password.
 
-        Raises `TwoFactorRequired` when Xiaomi wants verification. Once the
-        user has completed it in a browser, call this again on the SAME client.
+        Raises `TwoFactorRequired` when Xiaomi wants browser verification, or
+        `CaptchaRequired` when it wants a captcha solved. Both retries must run
+        on the SAME client: the sign, the device id and the captcha's `ick`
+        cookie all belong to this login context.
         """
         if self._sign is None:
             self._sign = await self._async_login_sign(username)
@@ -211,6 +237,8 @@ class XiaomiCloud:
         }
         if self._sign:
             fields["_sign"] = self._sign
+        if captcha_code:
+            fields["captCode"] = captcha_code
 
         data = await self._async_account_call(
             "POST", f"{ACCOUNT_BASE}/pass/serviceLoginAuth2", params=fields
@@ -247,6 +275,9 @@ class XiaomiCloud:
             notification = data.get("notificationUrl")
             if notification:
                 raise TwoFactorRequired(notification)
+            captcha_url = data.get("captchaUrl")
+            if captcha_url:
+                raise CaptchaRequired(await self._async_fetch_captcha(captcha_url))
             _LOGGER.debug(
                 "serviceLogin refused us: %s",
                 {
@@ -281,6 +312,35 @@ class XiaomiCloud:
 
         if not self._service_token:
             raise XiaomiCloudError("login did not yield a serviceToken")
+
+    async def _async_fetch_captcha(self, captcha_url: str) -> str:
+        """Fetch the captcha image and return it as a data URI.
+
+        The response sets an `ick` cookie that the answer is checked against,
+        so it is kept and replayed on the retry.
+        """
+        url = captcha_url
+        if url.startswith("/"):
+            url = ACCOUNT_BASE + url
+        try:
+            async with self._session.get(
+                url,
+                headers={"User-Agent": self._agent},
+                cookies=self._account_cookies,
+                timeout=aiohttp.ClientTimeout(total=TIMEOUT),
+            ) as response:
+                if response.status != 200:
+                    raise XiaomiCloudError(f"captcha image: HTTP {response.status}")
+                ick = response.cookies.get("ick")
+                if ick:
+                    self._ick = ick.value
+                payload = await response.read()
+                content_type = response.headers.get("Content-Type", "image/jpeg")
+        except aiohttp.ClientError as err:
+            raise XiaomiCloudError(f"captcha image: {err}") from err
+
+        encoded = base64.b64encode(payload).decode()
+        return f"data:{content_type.split(';')[0]};base64,{encoded}"
 
     async def _async_account_call(
         self,
@@ -412,7 +472,9 @@ class XiaomiCloud:
             if isinstance(device, dict)
         ]
 
-    async def async_find_gateways(self) -> list[CloudDevice]:
+    async def async_find_gateways(
+        self, country: str | None = None
+    ) -> list[CloudDevice]:
         """EC2 gateways on the account, sweeping servers until some turn up.
 
         Which server an account lives on is not knowable in advance -- asking
@@ -420,19 +482,21 @@ class XiaomiCloud:
         is tried in turn and the sweep stops at the first that yields a gateway.
         """
         found: dict[str, CloudDevice] = {}
-        for country in COUNTRIES:
+        # An explicit choice is honoured; otherwise sweep every server.
+        candidates = (country,) if country else COUNTRIES
+        for server in candidates:
             try:
-                homes = await self._async_homes(country)
+                homes = await self._async_homes(server)
             except (XiaomiCloudError, ValueError, KeyError, TypeError) as err:
-                _LOGGER.debug("gethome failed for %r: %s", country, err)
+                _LOGGER.debug("gethome failed for %r: %s", server, err)
                 continue
             for home_id, owner_id in homes:
                 try:
                     devices = await self._async_devices_in_home(
-                        country, home_id, owner_id
+                        server, home_id, owner_id
                     )
                 except (XiaomiCloudError, ValueError, KeyError, TypeError) as err:
-                    _LOGGER.debug("home_device_list failed for %r: %s", country, err)
+                    _LOGGER.debug("home_device_list failed for %r: %s", server, err)
                     continue
                 for device in devices:
                     if device.is_ec2_gateway:

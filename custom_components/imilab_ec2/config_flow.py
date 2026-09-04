@@ -48,6 +48,7 @@ from .const import (
 from .discovery import discover
 from .miio import MiioError, MiioGateway
 from .xiaomi_cloud import (
+    CaptchaRequired,
     CloudDevice,
     TwoFactorRequired,
     XiaomiCloud,
@@ -58,13 +59,45 @@ _LOGGER = logging.getLogger(__name__)
 
 
 CONF_GATEWAY = "gateway"
+CONF_COUNTRY = "country"
+CONF_CAPTCHA = "captcha"
+
+# Where the account lives. The Xiaomi app calls mainland China the default, and
+# it is served from the bare host; every other region is a subdomain.
+COUNTRY_OPTIONS = [
+    {"value": "cn", "label": "Chinese mainland"},
+    {"value": "de", "label": "Europe"},
+    {"value": "us", "label": "United States"},
+    {"value": "ru", "label": "Russia"},
+    {"value": "sg", "label": "Singapore"},
+    {"value": "i2", "label": "India"},
+    {"value": "tw", "label": "Taiwan"},
+    {"value": "in", "label": "India (legacy)"},
+]
+
+
+def _country_selector() -> SelectSelector:
+    return SelectSelector(
+        SelectSelectorConfig(options=COUNTRY_OPTIONS, mode=SelectSelectorMode.DROPDOWN)
+    )
+
 
 CREDENTIALS_SCHEMA = vol.Schema(
-    {vol.Required(CONF_USERNAME): cv.string, vol.Required(CONF_PASSWORD): cv.string}
+    {
+        vol.Required(CONF_USERNAME): cv.string,
+        vol.Required(CONF_PASSWORD): cv.string,
+        vol.Required(CONF_COUNTRY, default="cn"): _country_selector(),
+    }
 )
 
+CAPTCHA_SCHEMA = vol.Schema({vol.Required(CONF_CAPTCHA): cv.string})
+
 TOKEN_SCHEMA = vol.Schema(
-    {vol.Required(CONF_USER_ID): cv.string, vol.Required(CONF_PASS_TOKEN): cv.string}
+    {
+        vol.Required(CONF_USER_ID): cv.string,
+        vol.Required(CONF_PASS_TOKEN): cv.string,
+        vol.Required(CONF_COUNTRY, default="cn"): _country_selector(),
+    }
 )
 
 
@@ -78,6 +111,8 @@ class Ec2ConfigFlow(ConfigFlow, domain=DOMAIN):
         self._username: str | None = None
         self._password: str | None = None
         self._two_factor_url: str | None = None
+        self._captcha_image: str | None = None
+        self._country: str = "cn"
         self._gateways: list[CloudDevice] = []
         self._lan: dict[int, str] = {}
 
@@ -100,9 +135,12 @@ class Ec2ConfigFlow(ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             self._username = user_input[CONF_USERNAME].strip()
             self._password = user_input[CONF_PASSWORD]
+            self._country = user_input.get(CONF_COUNTRY, "cn")
             result = await self._async_login()
             if result is not None:
                 return result
+            if self._last_error == "captcha_required":
+                return await self.async_step_captcha()
             if self._last_error == "two_factor_pending":
                 # Move on to the step that actually shows the verification
                 # link. Re-rendering this form instead would leave the user
@@ -121,6 +159,7 @@ class Ec2ConfigFlow(ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
 
         if user_input is not None:
+            self._country = user_input.get(CONF_COUNTRY, "cn")
             cloud = self._async_cloud()
             try:
                 await cloud.async_login_with_token(
@@ -136,6 +175,38 @@ class Ec2ConfigFlow(ConfigFlow, domain=DOMAIN):
 
         return self.async_show_form(
             step_id="token", data_schema=TOKEN_SCHEMA, errors=errors
+        )
+
+    async def async_step_captcha(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Show the captcha image and take the answer.
+
+        The image cannot simply be linked: Xiaomi ties it to an `ick` cookie
+        held by the client that will submit the answer, so a browser opening
+        the same URL would be shown a different one. It is therefore fetched
+        here and rendered inline.
+        """
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            result = await self._async_login(user_input[CONF_CAPTCHA].strip())
+            if result is not None:
+                return result
+            if self._last_error == "two_factor_pending":
+                return await self.async_step_two_factor()
+            # A fresh captcha comes with every refusal; the old one is spent.
+            errors["base"] = (
+                "captcha_wrong"
+                if self._last_error == "captcha_required"
+                else self._last_error
+            )
+
+        return self.async_show_form(
+            step_id="captcha",
+            data_schema=CAPTCHA_SCHEMA,
+            errors=errors,
+            description_placeholders={"image": self._captcha_image or ""},
         )
 
     async def async_step_two_factor(
@@ -189,6 +260,9 @@ class Ec2ConfigFlow(ConfigFlow, domain=DOMAIN):
             cloud = self._async_cloud()
             try:
                 await cloud.async_login(self._username, self._password)
+            except CaptchaRequired as err:
+                self._captcha_image = err.image_data_uri
+                return await self.async_step_captcha()
             except TwoFactorRequired as err:
                 self._two_factor_url = err.notification_url
                 return await self.async_step_two_factor()
@@ -263,7 +337,9 @@ class Ec2ConfigFlow(ConfigFlow, domain=DOMAIN):
             self._cloud = XiaomiCloud(async_create_clientsession(self.hass))
         return self._cloud
 
-    async def _async_login(self) -> ConfigFlowResult | None:
+    async def _async_login(
+        self, captcha_code: str | None = None
+    ) -> ConfigFlowResult | None:
         """Try the username/password login.
 
         Returns the next step, or None when the login did not complete -- the
@@ -274,7 +350,11 @@ class Ec2ConfigFlow(ConfigFlow, domain=DOMAIN):
         assert self._username is not None and self._password is not None
         cloud = self._async_cloud()
         try:
-            await cloud.async_login(self._username, self._password)
+            await cloud.async_login(self._username, self._password, captcha_code)
+        except CaptchaRequired as err:
+            self._captcha_image = err.image_data_uri
+            self._last_error = "captcha_required"
+            return None
         except TwoFactorRequired as err:
             self._two_factor_url = err.notification_url
             self._last_error = "two_factor_pending"
@@ -289,7 +369,7 @@ class Ec2ConfigFlow(ConfigFlow, domain=DOMAIN):
         """Ask the cloud for gateways, then confirm their addresses on the LAN."""
         assert self._cloud is not None
         try:
-            self._gateways = await self._cloud.async_find_gateways()
+            self._gateways = await self._cloud.async_find_gateways(self._country)
         except XiaomiCloudError as err:
             _LOGGER.debug("Could not list devices: %s", err)
             return self.async_abort(reason="cannot_connect")

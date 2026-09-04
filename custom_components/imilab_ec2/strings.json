@@ -11,10 +11,11 @@
       },
       "credentials": {
         "title": "Xiaomi account",
-        "description": "Use the account that OWNS the cameras. An account they are only shared with is never issued the P2P keys needed to stream, so it cannot work.",
+        "description": "Use the account that OWNS the cameras. An account they are only shared with is never issued the P2P keys needed to stream, so it cannot work.\n\nPick the region the account belongs to - the same one the Mi Home app is set to. Asking the wrong region simply finds no devices.",
         "data": {
           "username": "Xiaomi ID, email or phone number",
-          "password": "Password"
+          "password": "Password",
+          "country": "Region"
         }
       },
       "two_factor": {
@@ -26,7 +27,8 @@
         "description": "For accounts where a password sign-in will not complete. The passToken looks like V1:… and is what an existing working setup already stores.",
         "data": {
           "user_id": "Xiaomi user ID",
-          "pass_token": "passToken"
+          "pass_token": "passToken",
+          "country": "Region"
         }
       },
       "select": {
@@ -43,17 +45,26 @@
           "username": "Xiaomi ID, email or phone number",
           "password": "Password"
         }
+      },
+      "captcha": {
+        "title": "Enter the code from the image",
+        "description": "Xiaomi is asking for a captcha before it will accept the password. This usually appears after a few failed sign-in attempts.\n\n![captcha]({image})\n\nType the characters shown above.",
+        "data": {
+          "captcha": "Code from the image"
+        }
       }
     },
     "error": {
       "invalid_auth": "Xiaomi rejected those credentials.",
       "cannot_connect": "Could not reach the Xiaomi cloud.",
-      "two_factor_pending": "Verification is not complete yet. Finish it in your browser, then press Submit again."
+      "two_factor_pending": "Verification is not complete yet. Finish it in your browser, then press Submit again.",
+      "captcha_wrong": "That code was not accepted. A new image has been issued - try again.",
+      "captcha_required": "Xiaomi is asking for a captcha."
     },
     "abort": {
       "cannot_connect": "Could not reach the Xiaomi cloud to list your devices.",
       "already_configured": "Every gateway on this account is already set up.",
-      "no_gateways": "This account owns no EC2 gateways. Make sure you signed in with the account that OWNS the cameras, not one they are shared with.",
+      "no_gateways": "No EC2 gateways were found on this account in the selected region. Check that you picked the right region, and that you signed in with the account that OWNS the cameras rather than one they are shared with.",
       "no_address": "The gateway has no reachable address. It must be on the same network as Home Assistant.",
       "gateway_gone": "That gateway is no longer available.",
       "reauth_successful": "Signed in again successfully."
