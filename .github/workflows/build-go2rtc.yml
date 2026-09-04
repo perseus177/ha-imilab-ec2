@@ -23,9 +23,13 @@ on:
         required: true
         default: 1.9.14-ec2.1
       prerelease:
-        description: Mark the release as a pre-release
+        # Default true on purpose. HACS lists a repository's releases as the
+        # versions of the *integration* a user can install, and a binary
+        # release is not one of those. Marking it a pre-release keeps it out of
+        # that list while leaving the download URL perfectly usable.
+        description: Mark the release as a pre-release (keeps it out of the HACS version list)
         type: boolean
-        default: false
+        default: true
 
 permissions:
   contents: write
