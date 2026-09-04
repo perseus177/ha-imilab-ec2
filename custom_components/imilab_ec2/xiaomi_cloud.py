@@ -86,8 +86,7 @@ def api_host(region: str | None) -> str:
 
 
 def _strip_guard(text: str) -> Any:
-    if text.startswith(JSON_GUARD):
-        text = text[len(JSON_GUARD) :]
+    text = text.removeprefix(JSON_GUARD)
     try:
         return json.loads(text)
     except ValueError as err:
@@ -116,7 +115,7 @@ class XiaomiCloud:
         `async_login_with_token` afterwards once the user has verified.
         """
         sign = await self._async_login_sign()
-        hashed = hashlib.md5(password.encode()).hexdigest().upper()  # noqa: S324
+        hashed = hashlib.md5(password.encode()).hexdigest().upper()
 
         payload = {
             "sid": SID,

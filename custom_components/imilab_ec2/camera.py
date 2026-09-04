@@ -18,7 +18,6 @@ import logging
 from dataclasses import dataclass
 
 import aiohttp
-
 from homeassistant.components.camera import Camera, CameraEntityFeature
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
@@ -57,7 +56,9 @@ async def async_setup_entry(
         # streams still exist in go2rtc for external players such as Kodi --
         # they just do not each need their own Home Assistant entity.
         entities.append(
-            Ec2Camera(data, camera.slug, _StreamRef(name=camera.slug, quality_suffix=""))
+            Ec2Camera(
+                data, camera.slug, _StreamRef(name=camera.slug, quality_suffix="")
+            )
         )
 
     async_add_entities(entities)

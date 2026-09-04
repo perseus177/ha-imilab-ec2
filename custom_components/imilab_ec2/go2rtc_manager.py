@@ -29,7 +29,6 @@ from pathlib import Path
 
 import aiohttp
 import yaml
-
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 

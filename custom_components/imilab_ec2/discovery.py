@@ -48,7 +48,7 @@ def discover(timeout: float = LISTEN_SECONDS) -> dict[int, str]:
         while time.time() < deadline:
             try:
                 data, addr = sock.recvfrom(4096)
-            except socket.timeout:
+            except TimeoutError:
                 continue
             except OSError:
                 break

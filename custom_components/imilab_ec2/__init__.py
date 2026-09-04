@@ -12,6 +12,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers.event import async_track_time_interval
 
+from .auth import TokenRenewer
 from .const import (
     CONF_API_LISTEN,
     CONF_CAMERAS,
@@ -28,7 +29,6 @@ from .const import (
     DOMAIN,
     TOKEN_CHECK_INTERVAL,
 )
-from .auth import TokenRenewer
 from .coordinator import Ec2Coordinator, Ec2RuntimeData, static_camera
 from .go2rtc_manager import Go2rtcError, Go2rtcManager, build_streams
 from .miio import MiioError, MiioGateway

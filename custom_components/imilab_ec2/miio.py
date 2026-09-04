@@ -96,8 +96,8 @@ class MiioGateway:
     def __init__(self, host: str, token: str) -> None:
         self._host = host
         self._token = bytes.fromhex(token)
-        self._key = hashlib.md5(self._token).digest()  # noqa: S324 - miio spec
-        self._iv = hashlib.md5(self._key + self._token).digest()  # noqa: S324
+        self._key = hashlib.md5(self._token).digest()
+        self._iv = hashlib.md5(self._key + self._token).digest()
         self._msg_id = 100
 
     # -- crypto ---------------------------------------------------------------
@@ -122,7 +122,7 @@ class MiioGateway:
         header = struct.pack(">HHII", 0x2131, 32 + len(enc), 0, did) + struct.pack(
             ">I", stamp
         )
-        checksum = hashlib.md5(header + self._token + enc).digest()  # noqa: S324
+        checksum = hashlib.md5(header + self._token + enc).digest()
         return header + checksum + enc
 
     # -- transport ------------------------------------------------------------
@@ -202,7 +202,7 @@ class MiioGateway:
                     return data
                 _LOGGER.debug("%s: skipping bodyless %d-byte packet", method, len(data))
             raise MiioError(f"{method}: only bodyless packets")
-        except socket.timeout as err:
+        except TimeoutError as err:
             # Silence here usually means "this gateway does not implement that
             # method" rather than "the gateway is down" -- it behaves the same
             # either way, so callers must not read this as unreachable.
@@ -220,7 +220,7 @@ class MiioGateway:
         sock.settimeout(TIMEOUT)
         try:
             did, _ = self._handshake(sock)
-        except (socket.timeout, OSError) as err:
+        except (TimeoutError, OSError) as err:
             raise MiioError(f"no miio handshake with {self._host}") from err
         finally:
             sock.close()
@@ -241,7 +241,9 @@ class MiioGateway:
         result = self._call("get_camera_list")
         if not isinstance(result, list):
             raise MiioError("get_camera_list returned no list")
-        cameras = [CameraInfo.from_dict(item) for item in result if isinstance(item, dict)]
+        cameras = [
+            CameraInfo.from_dict(item) for item in result if isinstance(item, dict)
+        ]
         if not cameras:
             raise MiioError("gateway reports no cameras")
         return cameras
