@@ -152,6 +152,17 @@ def _decrypt_rc4(password: str, payload: str) -> bytes:
     return _rc4(base64.b64decode(password), base64.b64decode(payload))
 
 
+def _image_mime(payload: bytes) -> str:
+    """Sniff an image type; Xiaomi's own Content-Type is not usable."""
+    if payload[:3] == bytes((0xFF, 0xD8, 0xFF)):
+        return "image/jpeg"
+    if payload[:4] == bytes((0x89, 0x50, 0x4E, 0x47)):
+        return "image/png"
+    if payload[:4] == b"GIF8":
+        return "image/gif"
+    return "image/jpeg"
+
+
 def _generate_agent() -> str:
     suffix = "".join(chr(65 + b % 5) for b in os.urandom(13))
     prefix = "".join(chr(97 + b % 26) for b in os.urandom(18))
@@ -335,12 +346,14 @@ class XiaomiCloud:
                 if ick:
                     self._ick = ick.value
                 payload = await response.read()
-                content_type = response.headers.get("Content-Type", "image/jpeg")
         except aiohttp.ClientError as err:
             raise XiaomiCloudError(f"captcha image: {err}") from err
 
+        # Xiaomi serves the image as application/octet-stream. Handing that
+        # straight to a data URI leaves the browser with nothing to render, so
+        # the real type is taken from the magic bytes instead of the header.
         encoded = base64.b64encode(payload).decode()
-        return f"data:{content_type.split(';')[0]};base64,{encoded}"
+        return f"data:{_image_mime(payload)};base64,{encoded}"
 
     async def _async_account_call(
         self,
