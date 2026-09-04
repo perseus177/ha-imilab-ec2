@@ -1,23 +1,27 @@
 """Xiaomi account client.
 
-A faithful port of the client in the Xiaomi Cloud Map Extractor
-(`PiotrMachowski/Home-Assistant-custom-components-Xiaomi-Cloud-Map-Extractor`,
-MIT), translated from `requests` to `aiohttp`. That implementation is known to
-work against the live service; re-deriving it produced subtle differences that
-broke two-factor sign-ins, so the sequence, the signing, and the header and
-cookie sets here deliberately mirror it rather than improve on it.
+Ported rather than derived, because deriving it produced a string of subtle
+differences that each broke sign-in in their own way.
 
-Login:
+The **login** follows go2rtc's `pkg/xiaomi/cloud.go`, which completes a
+challenged sign-in entirely in-process:
 
-    GET  /pass/serviceLogin?sid=xiaomiio&_json=true   -> _sign
-    POST /pass/serviceLoginAuth2                      -> ssecurity + passToken
+    GET  /pass/serviceLogin?sid=xiaomiio&_json=true   -> _sign, sid, callback, qs
+    POST /pass/serviceLoginAuth2  (form in the BODY)  -> ssecurity + passToken,
+                                                        or a captcha, or a
+                                                        verification demand
     GET  <location>                                   -> serviceToken cookie
 
-Both account calls put their fields in the QUERY STRING, not the body.
+A verification is started here, Xiaomi sends the code, and the code is
+submitted here. Sending the user to Xiaomi's web page instead completes a
+sign-in for the *browser* and leaves this client where it was, which loops
+forever.
 
-Device discovery goes through the RC4-encrypted API: list the account's homes
-(its own and the shared ones), then the devices in each. Responses carry a
-`&&&START&&&` guard that has to be stripped before parsing.
+**Device discovery** follows the Xiaomi Cloud Map Extractor: RC4-encrypted
+calls listing the account's homes (its own and the shared ones), then the
+devices in each.
+
+Responses carry a `&&&START&&&` guard that has to be stripped before parsing.
 
 Why any of this is needed: these cameras cannot stream without the cloud, since
 every connection fetches fresh P2P keys from it. Having to authenticate anyway,
@@ -163,6 +167,21 @@ def _decrypt_rc4(password: str, payload: str) -> bytes:
     return _rc4(base64.b64decode(password), base64.b64decode(payload))
 
 
+def _reason(data: dict) -> str:
+    """The most useful message Xiaomi gave us.
+
+    Its `tips` field is a localised, human sentence -- "too many codes sent,
+    try again tomorrow" -- while `desc` is often the same thing in Chinese.
+    Discarding tips and showing a generic failure turns a clear answer into a
+    mystery, which is exactly what happened with the daily code limit.
+    """
+    for key in ("tips", "desc", "description"):
+        value = data.get(key)
+        if value:
+            return str(value)
+    return "rejected"
+
+
 def _image_mime(payload: bytes) -> str:
     """Sniff an image type; Xiaomi's own Content-Type is not usable."""
     if payload[:3] == bytes((0xFF, 0xD8, 0xFF)):
@@ -265,9 +284,7 @@ class XiaomiCloud:
         )
         location = data.get("location")
         if not location:
-            raise XiaomiCloudError(
-                f"verification rejected: {data.get('desc') or data.get('code')}"
-            )
+            raise XiaomiCloudError(_reason(data))
         await self._async_finish(location)
 
     async def _async_login_step(self) -> None:
@@ -298,6 +315,14 @@ class XiaomiCloud:
             cookies=cookies,
         )
 
+        # Reset the state bag to just the credentials before handling whatever
+        # comes next, exactly as go2rtc does. A captcha code is single use, and
+        # carrying a spent one forward taints the next step.
+        self._auth = {
+            "username": self._auth.get("username", ""),
+            "password": self._auth.get("password", ""),
+        }
+
         captcha = data.get("captchaUrl") or data.get("captchaURL")
         if captcha:
             await self._async_get_captcha(captcha)
@@ -311,8 +336,7 @@ class XiaomiCloud:
                 "serviceLogin refused us: %s",
                 {k: v for k, v in data.items() if k not in ("passToken", "ssecurity")},
             )
-            desc = data.get("desc") or data.get("description") or "sign-in rejected"
-            raise XiaomiCloudError(f"{desc} (code {data.get('code')})")
+            raise XiaomiCloudError(f"{_reason(data)} (code {data.get('code')})")
 
         self._auth.clear()
         self.ssecurity = data.get("ssecurity")
@@ -388,9 +412,9 @@ class XiaomiCloud:
         if captcha:
             await self._async_get_captcha(captcha)
         if sent.get("code") not in (0, None):
-            raise XiaomiCloudError(
-                f"could not send the code: {sent.get('desc') or sent}"
-            )
+            # 70022 is the daily cap on verification codes. It is not a fault
+            # in the sign-in; nothing here will get past it until it resets.
+            raise XiaomiCloudError(_reason(sent))
 
         raise VerificationRequired(
             info.get("maskedPhone") or "", info.get("maskedEmail") or ""
