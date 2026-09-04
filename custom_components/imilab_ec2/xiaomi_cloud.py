@@ -108,6 +108,12 @@ class XiaomiCloud:
         self.pass_token: str | None = None
         self.ssecurity: str | None = None
         self._service_token: str | None = None
+        # Cached from the first attempt and reused on retries. The
+        # verification URL Xiaomi hands back is bound to the login context this
+        # sign identifies, so fetching a fresh one for the retry would start a
+        # new context that knows nothing about the verification the user just
+        # completed.
+        self._sign: str | None = None
 
     @property
     def _base_cookies(self) -> dict[str, str]:
@@ -127,7 +133,9 @@ class XiaomiCloud:
         -- the device id and cookie jar have to match the attempt that was
         challenged.
         """
-        sign = await self._async_login_sign(username)
+        if self._sign is None:
+            self._sign = await self._async_login_sign(username)
+        sign = self._sign
         hashed = hashlib.md5(password.encode()).hexdigest().upper()
 
         payload = {
@@ -144,7 +152,18 @@ class XiaomiCloud:
         data = await self._async_post_form(
             f"{ACCOUNT_BASE}/pass/serviceLoginAuth2", payload
         )
-        await self._async_finish_login(data)
+        try:
+            await self._async_finish_login(data)
+        except TwoFactorRequired:
+            # Keep the sign: the verification the user is about to do belongs
+            # to this context, and the retry has to come back to it.
+            raise
+        except XiaomiCloudError:
+            # Anything else (a wrong password, an expired sign) means the
+            # context is spent; start clean next time.
+            self._sign = None
+            raise
+        self._sign = None
 
     async def async_login_with_token(self, user_id: str, pass_token: str) -> None:
         """Log in using a passToken -- no password, no verification code.
