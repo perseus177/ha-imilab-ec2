@@ -98,23 +98,36 @@ class XiaomiCloud:
 
     def __init__(self, session: aiohttp.ClientSession) -> None:
         self._session = session
-        self._device_id = "".join(
-            f"{b:02x}" for b in os.urandom(8)
-        )  # stable per flow is enough
+        # Six lowercase letters, the shape Xiaomi's own SDK uses. It must stay
+        # STABLE for the life of this client: a completed two-factor
+        # verification is bound to this device id, so regenerating it on a
+        # retry makes the account look like a new device and the verification
+        # the user just did counts for nothing.
+        self._device_id = "".join(chr(97 + b % 26) for b in os.urandom(6))
         self.user_id: str | None = None
         self.pass_token: str | None = None
         self.ssecurity: str | None = None
         self._service_token: str | None = None
+
+    @property
+    def _base_cookies(self) -> dict[str, str]:
+        """Cookies every account request carries."""
+        return {
+            "sdkVersion": "accountsdk-18.8.15",
+            "deviceId": self._device_id,
+        }
 
     # -- login ---------------------------------------------------------------
 
     async def async_login(self, username: str, password: str) -> None:
         """Log in with a username and password.
 
-        Raises `TwoFactorRequired` when Xiaomi wants a code; call
-        `async_login_with_token` afterwards once the user has verified.
+        Raises `TwoFactorRequired` when Xiaomi wants a code. Once the user has
+        completed verification in a browser, call this again on the SAME client
+        -- the device id and cookie jar have to match the attempt that was
+        challenged.
         """
-        sign = await self._async_login_sign()
+        sign = await self._async_login_sign(username)
         hashed = hashlib.md5(password.encode()).hexdigest().upper()
 
         payload = {
@@ -139,15 +152,21 @@ class XiaomiCloud:
         This is the same path go2rtc uses, and the reason a working setup keeps
         working without ever storing a password.
         """
-        cookies = {"userId": user_id, "passToken": pass_token}
+        cookies = {**self._base_cookies, "userId": user_id, "passToken": pass_token}
         data = await self._async_get_json(
             f"{ACCOUNT_BASE}/pass/serviceLogin?sid={SID}&_json=true", cookies=cookies
         )
         await self._async_finish_login(data)
 
-    async def _async_login_sign(self) -> str | None:
+    async def _async_login_sign(self, username: str | None = None) -> str | None:
+        """Fetch the `_sign` nonce that serviceLoginAuth2 wants."""
+        cookies = dict(self._base_cookies)
+        if username:
+            # Xiaomi's own SDK sends this; without it some accounts get a sign
+            # that the following POST then rejects.
+            cookies["userId"] = username
         data = await self._async_get_json(
-            f"{ACCOUNT_BASE}/pass/serviceLogin?sid={SID}&_json=true"
+            f"{ACCOUNT_BASE}/pass/serviceLogin?sid={SID}&_json=true", cookies=cookies
         )
         return data.get("_sign")
 
@@ -161,6 +180,14 @@ class XiaomiCloud:
                 raise TwoFactorRequired(notification)
             code = data.get("code")
             desc = data.get("desc") or data.get("description") or "login rejected"
+            _LOGGER.debug(
+                "serviceLogin refused us: %s",
+                {
+                    k: v
+                    for k, v in data.items()
+                    if k not in ("passToken", "ssecurity", "location")
+                },
+            )
             raise XiaomiCloudError(f"{desc} (code {code})")
 
         self.ssecurity = data["ssecurity"]
@@ -308,7 +335,7 @@ class XiaomiCloud:
                     "User-Agent": "".join(AGENT),
                     "Content-Type": "application/x-www-form-urlencoded",
                 },
-                cookies={"sdkVersion": "3.9", "deviceId": self._device_id},
+                cookies=self._base_cookies,
                 timeout=aiohttp.ClientTimeout(total=TIMEOUT),
             ) as response:
                 text = await response.text()

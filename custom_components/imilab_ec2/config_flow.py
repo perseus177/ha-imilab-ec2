@@ -27,7 +27,7 @@ from typing import Any
 import voluptuous as vol
 from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.helpers import config_validation as cv
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.aiohttp_client import async_create_clientsession
 from homeassistant.helpers.selector import (
     SelectSelector,
     SelectSelectorConfig,
@@ -116,7 +116,7 @@ class Ec2ConfigFlow(ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
 
         if user_input is not None:
-            cloud = XiaomiCloud(async_get_clientsession(self.hass))
+            cloud = self._async_cloud()
             try:
                 await cloud.async_login_with_token(
                     user_input[CONF_USER_ID].strip(),
@@ -149,7 +149,9 @@ class Ec2ConfigFlow(ConfigFlow, domain=DOMAIN):
             result = await self._async_login()
             if result is not None:
                 return result
-            errors["base"] = "two_factor_pending"
+            # Still refused. Say which of the two reasons it was, rather than
+            # silently redrawing the same dialog.
+            errors["base"] = self._last_error
 
         return self.async_show_form(
             step_id="two_factor",
@@ -179,7 +181,7 @@ class Ec2ConfigFlow(ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             self._username = user_input[CONF_USERNAME].strip()
             self._password = user_input[CONF_PASSWORD]
-            cloud = XiaomiCloud(async_get_clientsession(self.hass))
+            cloud = self._async_cloud()
             try:
                 await cloud.async_login(self._username, self._password)
             except TwoFactorRequired as err:
@@ -242,21 +244,40 @@ class Ec2ConfigFlow(ConfigFlow, domain=DOMAIN):
             ),
         )
 
+    def _async_cloud(self) -> XiaomiCloud:
+        """The one cloud client for this flow.
+
+        Reused across retries on purpose. Xiaomi ties a completed verification
+        to the `deviceId` cookie, so building a fresh client for each attempt
+        makes every retry look like a brand new device and the verification the
+        user just did never applies. It also keeps the cookie jar coherent
+        across the three-request login sequence, which is why this gets its own
+        session rather than the one shared with every other integration.
+        """
+        if self._cloud is None:
+            self._cloud = XiaomiCloud(async_create_clientsession(self.hass))
+        return self._cloud
+
     async def _async_login(self) -> ConfigFlowResult | None:
-        """Try the username/password login; None means it did not complete."""
+        """Try the username/password login.
+
+        Returns the next step, or None when the login did not complete -- the
+        caller then re-renders its own form with `self._last_error`. It must not
+        call a step itself: doing so returns a form the caller mistakes for
+        success, and the user sees the dialog redraw with no explanation.
+        """
         assert self._username is not None and self._password is not None
-        cloud = XiaomiCloud(async_get_clientsession(self.hass))
+        cloud = self._async_cloud()
         try:
             await cloud.async_login(self._username, self._password)
         except TwoFactorRequired as err:
             self._two_factor_url = err.notification_url
             self._last_error = "two_factor_pending"
-            return await self.async_step_two_factor()
+            return None
         except XiaomiCloudError as err:
             _LOGGER.debug("Login failed: %s", err)
             self._last_error = "invalid_auth"
             return None
-        self._cloud = cloud
         return await self._async_after_login()
 
     async def _async_after_login(self) -> ConfigFlowResult:
