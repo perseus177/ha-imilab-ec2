@@ -18,10 +18,6 @@
           "country": "Region"
         }
       },
-      "two_factor": {
-        "title": "Verification required",
-        "description": "Xiaomi wants to verify this sign-in.\n\n1. Open this link and complete the verification:\n{url}\n\n2. Come back here and press Submit.\n\n**Important:** open the link from a device on the same network as Home Assistant. Xiaomi ties this to your public IP address, so verifying from somewhere else will not unlock the sign-in."
-      },
       "token": {
         "title": "User ID and passToken",
         "description": "For accounts where a password sign-in will not complete. The passToken looks like V1:… and is what an existing working setup already stores.",
@@ -52,14 +48,22 @@
         "data": {
           "captcha": "Code from the image"
         }
+      },
+      "code": {
+        "title": "Enter the verification code",
+        "description": "Xiaomi has sent a code to **{destination}**.\n\nType it in below. There is no web page to visit - the verification is handled here.",
+        "data": {
+          "code": "Verification code"
+        }
       }
     },
     "error": {
       "invalid_auth": "Xiaomi rejected those credentials.",
       "cannot_connect": "Could not reach the Xiaomi cloud.",
-      "two_factor_pending": "Verification is not complete yet. Finish it in your browser, then press Submit again.",
       "captcha_wrong": "That code was not accepted. A new image has been issued - try again.",
-      "captcha_required": "Xiaomi is asking for a captcha."
+      "captcha_required": "Xiaomi is asking for a captcha.",
+      "code_required": "Xiaomi wants a verification code.",
+      "invalid_code": "That code was not accepted."
     },
     "abort": {
       "cannot_connect": "Could not reach the Xiaomi cloud to list your devices.",

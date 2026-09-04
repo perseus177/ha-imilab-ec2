@@ -37,7 +37,7 @@ from .const import (
     CONF_USERNAME,
     TOKEN_RETRY_COOLDOWN,
 )
-from .xiaomi_cloud import TwoFactorRequired, XiaomiCloud, XiaomiCloudError
+from .xiaomi_cloud import VerificationRequired, XiaomiCloud, XiaomiCloudError
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -96,11 +96,11 @@ class TokenRenewer:
         cloud = XiaomiCloud(async_get_clientsession(self._hass))
         try:
             await cloud.async_login(username, password)
-        except TwoFactorRequired as err:
+        except VerificationRequired as err:
             _LOGGER.warning(
-                "Xiaomi wants verification before it will renew the session. "
-                "Open this from a device on the same network as Home Assistant: %s",
-                err.notification_url,
+                "Xiaomi wants a verification code before it will renew the "
+                "session; it has been sent to %s. Re-authentication is needed",
+                err.destination,
             )
             self._escalate()
             return False

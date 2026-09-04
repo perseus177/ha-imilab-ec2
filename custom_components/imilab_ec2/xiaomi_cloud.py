@@ -76,12 +76,23 @@ class CaptchaRequired(XiaomiCloudError):
         self.image_data_uri = image_data_uri
 
 
-class TwoFactorRequired(XiaomiCloudError):
-    """Xiaomi wants verification before it will finish the login."""
+class VerificationRequired(XiaomiCloudError):
+    """Xiaomi has sent a code by email or SMS and is waiting for it.
 
-    def __init__(self, notification_url: str) -> None:
-        super().__init__("two-factor verification required")
-        self.notification_url = notification_url
+    The code is already on its way by the time this is raised: unlike sending
+    the user off to a web page, the verification is driven from here, so the
+    only thing left is to type in what arrived.
+    """
+
+    def __init__(self, masked_phone: str, masked_email: str) -> None:
+        super().__init__("verification code required")
+        self.masked_phone = masked_phone
+        self.masked_email = masked_email
+
+    @property
+    def destination(self) -> str:
+        """Where the code went, as Xiaomi masks it."""
+        return self.masked_email or self.masked_phone or "your registered contact"
 
 
 @dataclass(frozen=True)
@@ -204,182 +215,276 @@ class XiaomiCloud:
     def __init__(self, session: aiohttp.ClientSession) -> None:
         self._session = session
         self._agent = _generate_agent()
-        self._device_id = "".join(chr(97 + b % 26) for b in os.urandom(6))
+        alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+        self._device_id = "".join(alphabet[b % len(alphabet)] for b in os.urandom(16))
         self.user_id: str | None = None
         self.c_user_id: str | None = None
         self.pass_token: str | None = None
         self.ssecurity: str | None = None
         self._service_token: str | None = None
-        # Cached from the challenged attempt and reused on retry: the
-        # verification URL is bound to the login context this identifies.
-        self._sign: str | None = None
-        # Set when a captcha is issued; the answer is only valid alongside it.
-        self._ick: str | None = None
-
-    @property
-    def _account_cookies(self) -> dict[str, str]:
-        cookies = {"sdkVersion": "accountsdk-18.8.15", "deviceId": self._device_id}
-        if self._ick:
-            cookies["ick"] = self._ick
-        return cookies
+        # Carries state across a challenged sign-in: credentials, the
+        # captcha's ick cookie, and the verification flag and session. Mirrors
+        # the auth map go2rtc keeps for exactly the same reason.
+        self._auth: dict[str, str] = {}
 
     # -- login ---------------------------------------------------------------
+    #
+    # Ported from go2rtc's pkg/xiaomi/cloud.go, which completes a challenged
+    # sign-in entirely in-process: it starts the verification itself, has
+    # Xiaomi send the code, and submits it. No browser is involved, which is
+    # why the same account signs in there on the first attempt.
 
-    async def async_login(
-        self, username: str, password: str, captcha_code: str | None = None
-    ) -> None:
-        """Log in with a username and password.
+    async def async_login(self, username: str, password: str) -> None:
+        """Sign in. Raises CaptchaRequired or VerificationRequired to continue."""
+        self._auth["username"] = username
+        self._auth["password"] = password
+        await self._async_login_step()
 
-        Raises `TwoFactorRequired` when Xiaomi wants browser verification, or
-        `CaptchaRequired` when it wants a captcha solved. Both retries must run
-        on the SAME client: the sign, the device id and the captcha's `ick`
-        cookie all belong to this login context.
-        """
-        if self._sign is None:
-            self._sign = await self._async_login_sign(username)
+    async def async_login_with_captcha(self, code: str) -> None:
+        """Answer a captcha and carry on from wherever it interrupted."""
+        self._auth["captcha_code"] = code
+        if self._auth.get("flag"):
+            # The captcha interrupted the verification, not the password.
+            await self._async_send_ticket()
+            return
+        await self._async_login_step()
 
-        fields = {
-            "sid": SID,
-            "hash": hashlib.md5(password.encode()).hexdigest().upper(),
-            "callback": STS_CALLBACK,
-            "qs": "%3Fsid%3Dxiaomiio%26_json%3Dtrue",
-            "user": username,
-            "_json": "true",
-        }
-        if self._sign:
-            fields["_sign"] = self._sign
-        if captcha_code:
-            fields["captCode"] = captcha_code
-
-        data = await self._async_account_call(
-            "POST", f"{ACCOUNT_BASE}/pass/serviceLoginAuth2", params=fields
+    async def async_login_with_verify(self, ticket: str) -> None:
+        """Submit the code Xiaomi sent by email or SMS."""
+        flag = self._auth.get("flag")
+        if not flag:
+            raise XiaomiCloudError("no verification in progress")
+        name = self._verify_name()
+        # go2rtc builds this parameter without an "=" and Xiaomi accepts it.
+        # Kept identical rather than tidied: this is the form known to work.
+        params = f"_flag{flag}&ticket={ticket}&trust=false&_json=true"
+        data = await self._async_raw(
+            "POST",
+            f"{ACCOUNT_BASE}/identity/auth/verify{name}?{params}",
+            cookies=f"identity_session={self._auth.get('identity_session', '')}",
         )
-        try:
-            await self._async_finish_login(data)
-        except TwoFactorRequired:
-            raise
-        except XiaomiCloudError:
-            self._sign = None
-            raise
-        self._sign = None
-
-    async def async_login_with_token(self, user_id: str, pass_token: str) -> None:
-        """Log in using a passToken -- no password, no verification."""
-        data = await self._async_account_call(
-            "GET",
-            f"{ACCOUNT_BASE}/pass/serviceLogin?sid={SID}&_json=true",
-            cookies={"userId": user_id, "passToken": pass_token},
-        )
-        await self._async_finish_login(data)
-
-    async def _async_login_sign(self, username: str) -> str | None:
-        data = await self._async_account_call(
-            "GET",
-            f"{ACCOUNT_BASE}/pass/serviceLogin?sid={SID}&_json=true",
-            cookies={"userId": username},
-        )
-        return data.get("_sign")
-
-    async def _async_finish_login(self, data: dict[str, Any]) -> None:
-        ssecurity = data.get("ssecurity")
-        if not ssecurity or len(str(ssecurity)) <= 4:
-            notification = data.get("notificationUrl")
-            if notification:
-                raise TwoFactorRequired(notification)
-            captcha_url = data.get("captchaUrl")
-            if captcha_url:
-                raise CaptchaRequired(await self._async_fetch_captcha(captcha_url))
-            _LOGGER.debug(
-                "serviceLogin refused us: %s",
-                {
-                    k: v
-                    for k, v in data.items()
-                    if k not in ("passToken", "ssecurity", "location")
-                },
+        location = data.get("location")
+        if not location:
+            raise XiaomiCloudError(
+                f"verification rejected: {data.get('desc') or data.get('code')}"
             )
-            desc = data.get("desc") or data.get("description") or "login rejected"
-            raise XiaomiCloudError(f"{desc} (code {data.get('code')})")
+        await self._async_finish(location)
 
-        self.ssecurity = ssecurity
-        self.user_id = str(data.get("userId") or "")
-        self.c_user_id = data.get("cUserId")
-        self.pass_token = data.get("passToken")
+    async def _async_login_step(self) -> None:
+        first = await self._async_raw(
+            "GET", f"{ACCOUNT_BASE}/pass/serviceLogin?_json=true&sid={SID}"
+        )
+        # sid, callback and qs are taken from this response. Hardcoding them is
+        # one of the ways a hand-rolled client drifts from the real one.
+        digest = hashlib.md5(self._auth["password"].encode()).hexdigest()
+        form = {
+            "_json": "true",
+            "hash": digest.upper(),
+            "sid": first.get("sid", SID),
+            "callback": first.get("callback", STS_CALLBACK),
+            "_sign": first.get("_sign", ""),
+            "qs": first.get("qs", ""),
+            "user": self._auth["username"],
+        }
+        cookies = f"deviceId={self._device_id}"
+        if self._auth.get("captcha_code"):
+            form["captCode"] = self._auth["captcha_code"]
+            cookies += f"; ick={self._auth.get('ick', '')}"
+
+        data = await self._async_raw(
+            "POST",
+            f"{ACCOUNT_BASE}/pass/serviceLoginAuth2",
+            form=form,
+            cookies=cookies,
+        )
+
+        captcha = data.get("captchaUrl") or data.get("captchaURL")
+        if captcha:
+            await self._async_get_captcha(captcha)
+        notification = data.get("notificationUrl")
+        if notification:
+            await self._async_auth_start(notification)
 
         location = data.get("location")
         if not location:
-            raise XiaomiCloudError("login response carried no location")
+            _LOGGER.debug(
+                "serviceLogin refused us: %s",
+                {k: v for k, v in data.items() if k not in ("passToken", "ssecurity")},
+            )
+            desc = data.get("desc") or data.get("description") or "sign-in rejected"
+            raise XiaomiCloudError(f"{desc} (code {data.get('code')})")
 
-        # Following the location is what mints the serviceToken cookie.
-        try:
-            async with self._session.get(
-                location,
-                headers={"User-Agent": self._agent, "Content-Type": FORM_CT},
-                timeout=aiohttp.ClientTimeout(total=TIMEOUT),
-            ) as response:
-                token = response.cookies.get("serviceToken")
-                self._service_token = token.value if token else None
-        except aiohttp.ClientError as err:
-            raise XiaomiCloudError(f"could not complete login: {err}") from err
+        self._auth.clear()
+        self.ssecurity = data.get("ssecurity")
+        self.pass_token = data.get("passToken")
+        await self._async_finish(location)
 
-        if not self._service_token:
-            raise XiaomiCloudError("login did not yield a serviceToken")
-
-    async def _async_fetch_captcha(self, captcha_url: str) -> str:
-        """Fetch the captcha image and return it as a data URI.
-
-        The response sets an `ick` cookie that the answer is checked against,
-        so it is kept and replayed on the retry.
-        """
+    async def _async_get_captcha(self, captcha_url: str) -> None:
+        """Fetch the captcha image and hand it up; the ick cookie is kept."""
         url = captcha_url
         if url.startswith("/"):
             url = ACCOUNT_BASE + url
         try:
             async with self._session.get(
                 url,
-                headers={"User-Agent": self._agent},
-                cookies=self._account_cookies,
+                headers={
+                    "User-Agent": self._agent,
+                    "Cookie": f"deviceId={self._device_id}",
+                },
                 timeout=aiohttp.ClientTimeout(total=TIMEOUT),
             ) as response:
-                if response.status != 200:
-                    raise XiaomiCloudError(f"captcha image: HTTP {response.status}")
+                payload = await response.read()
                 ick = response.cookies.get("ick")
                 if ick:
-                    self._ick = ick.value
-                payload = await response.read()
+                    self._auth["ick"] = ick.value
         except aiohttp.ClientError as err:
             raise XiaomiCloudError(f"captcha image: {err}") from err
 
-        # Xiaomi serves the image as application/octet-stream. Handing that
-        # straight to a data URI leaves the browser with nothing to render, so
-        # the real type is taken from the magic bytes instead of the header.
+        # Xiaomi serves this as application/octet-stream, so the type comes
+        # from the magic bytes rather than the header.
         encoded = base64.b64encode(payload).decode()
-        return f"data:{_image_mime(payload)};base64,{encoded}"
+        raise CaptchaRequired(f"data:{_image_mime(payload)};base64,{encoded}")
 
-    async def _async_account_call(
+    async def _async_auth_start(self, notification_url: str) -> None:
+        """Begin verification and have Xiaomi send the code."""
+        url = notification_url.replace(
+            "/fe/service/identity/authStart", "/identity/list", 1
+        )
+        data, jar = await self._async_raw_with_cookies("GET", url)
+        self._auth["flag"] = str(data.get("flag", ""))
+        session = jar.get("identity_session")
+        if session:
+            self._auth["identity_session"] = session.value
+        await self._async_send_ticket()
+
+    def _verify_name(self) -> str:
+        return {"4": "Phone", "8": "Email"}.get(self._auth.get("flag", ""), "")
+
+    async def _async_send_ticket(self) -> None:
+        """Ask Xiaomi to send the code, then report where it went."""
+        name = self._verify_name()
+        flag = self._auth.get("flag", "")
+        cookies = f"identity_session={self._auth.get('identity_session', '')}"
+
+        info = await self._async_raw(
+            "GET",
+            f"{ACCOUNT_BASE}/identity/auth/verify{name}?_flag={flag}&_json=true",
+            cookies=cookies,
+        )
+
+        send_cookies = cookies
+        captcha_code = self._auth.get("captcha_code", "")
+        if captcha_code:
+            send_cookies += f"; ick={self._auth.get('ick', '')}"
+
+        sent = await self._async_raw(
+            "POST",
+            f"{ACCOUNT_BASE}/identity/auth/send{name}Ticket",
+            form={"_json": "true", "icode": captcha_code, "retry": "0"},
+            cookies=send_cookies,
+        )
+
+        captcha = sent.get("captchaUrl") or sent.get("captchaURL")
+        if captcha:
+            await self._async_get_captcha(captcha)
+        if sent.get("code") not in (0, None):
+            raise XiaomiCloudError(
+                f"could not send the code: {sent.get('desc') or sent}"
+            )
+
+        raise VerificationRequired(
+            info.get("maskedPhone") or "", info.get("maskedEmail") or ""
+        )
+
+    async def async_login_with_token(self, user_id: str, pass_token: str) -> None:
+        """Sign in using a passToken -- no password, no challenge."""
+        data = await self._async_raw(
+            "GET",
+            f"{ACCOUNT_BASE}/pass/serviceLogin?_json=true&sid={SID}",
+            cookies=f"userId={user_id}; passToken={pass_token}",
+        )
+        location = data.get("location")
+        if not location:
+            raise XiaomiCloudError("passToken rejected")
+        self.ssecurity = data.get("ssecurity")
+        self.pass_token = data.get("passToken") or pass_token
+        self.user_id = user_id
+        await self._async_finish(location)
+
+    async def _async_finish(self, location: str) -> None:
+        """Follow the callback; this is what mints userId and serviceToken."""
+        try:
+            async with self._session.get(
+                location,
+                headers={"User-Agent": self._agent},
+                timeout=aiohttp.ClientTimeout(total=TIMEOUT),
+            ) as response:
+                for name, cookie in response.cookies.items():
+                    if name == "userId":
+                        self.user_id = cookie.value
+                    elif name == "cUserId":
+                        self.c_user_id = cookie.value
+                    elif name == "serviceToken":
+                        self._service_token = cookie.value
+                    elif name == "passToken":
+                        self.pass_token = cookie.value
+                pragma = response.headers.get("Extension-Pragma")
+                if pragma:
+                    try:
+                        self.ssecurity = json.loads(pragma).get(
+                            "ssecurity", self.ssecurity
+                        )
+                    except ValueError:
+                        pass
+        except aiohttp.ClientError as err:
+            raise XiaomiCloudError(f"could not complete sign-in: {err}") from err
+
+        if not self._service_token:
+            raise XiaomiCloudError("sign-in did not yield a serviceToken")
+
+    async def _async_raw(
         self,
         method: str,
         url: str,
-        params: dict[str, str] | None = None,
-        cookies: dict[str, str] | None = None,
+        form: dict[str, str] | None = None,
+        cookies: str | None = None,
     ) -> dict[str, Any]:
-        """One account-service call. Fields go in the query string, both verbs."""
+        data, _ = await self._async_raw_with_cookies(method, url, form, cookies)
+        return data
+
+    async def _async_raw_with_cookies(
+        self,
+        method: str,
+        url: str,
+        form: dict[str, str] | None = None,
+        cookies: str | None = None,
+    ) -> tuple[dict[str, Any], Any]:
+        """One account call. The form goes in the BODY, as go2rtc sends it."""
+        headers = {"User-Agent": self._agent}
+        if cookies:
+            headers["Cookie"] = cookies
         try:
             async with self._session.request(
                 method,
                 url,
-                params=params,
-                headers={"User-Agent": self._agent, "Content-Type": FORM_CT},
-                cookies={**self._account_cookies, **(cookies or {})},
+                data=form,
+                headers=headers,
                 timeout=aiohttp.ClientTimeout(total=TIMEOUT),
             ) as response:
                 text = await response.text()
+                jar = response.cookies
         except aiohttp.ClientError as err:
             raise XiaomiCloudError(f"{url}: {err}") from err
 
-        parsed = _to_json(text)
+        if not text.startswith(JSON_GUARD):
+            raise XiaomiCloudError(f"unexpected response: {text[:200]}")
+        try:
+            parsed = json.loads(text[len(JSON_GUARD) :])
+        except ValueError as err:
+            raise XiaomiCloudError("unparseable response from Xiaomi") from err
         if not isinstance(parsed, dict):
-            raise XiaomiCloudError("unexpected response from the account service")
-        return parsed
+            raise XiaomiCloudError("unexpected response shape")
+        return parsed, jar
 
     # -- encrypted API -------------------------------------------------------
 
@@ -521,7 +626,7 @@ class XiaomiCloud:
 
 __all__ = [
     "CloudDevice",
-    "TwoFactorRequired",
+    "VerificationRequired",
     "XiaomiCloud",
     "XiaomiCloudError",
     "api_host",

@@ -11,11 +11,13 @@ knows the model; the scan knows the current address. Using both, and matching
 them on device id, beats either alone -- and streaming needs the account
 regardless, because every connection fetches fresh P2P keys from the cloud.
 
-Two-factor accounts follow the approach the Xiaomi Cloud Map Extractor uses:
-Xiaomi hands back a verification URL, the user opens it in their own browser,
-and the login is then retried. Note that Xiaomi ties that trust to the **public
-IP address**, so the verification has to happen from the same network as Home
-Assistant.
+Challenges -- a captcha, a verification code, or both, in any order and more
+than once -- are handled here rather than by sending the user to a web page.
+Verification is started from this client, Xiaomi sends the code, and the code
+is submitted from this client too, which is the approach go2rtc takes and the
+reason the same account signs in there on the first attempt. Sending the user
+to a browser instead completes a sign-in for the *browser* and leaves this one
+exactly where it was, which loops forever.
 """
 
 from __future__ import annotations
@@ -50,7 +52,7 @@ from .miio import MiioError, MiioGateway
 from .xiaomi_cloud import (
     CaptchaRequired,
     CloudDevice,
-    TwoFactorRequired,
+    VerificationRequired,
     XiaomiCloud,
     XiaomiCloudError,
 )
@@ -61,6 +63,7 @@ _LOGGER = logging.getLogger(__name__)
 CONF_GATEWAY = "gateway"
 CONF_COUNTRY = "country"
 CONF_CAPTCHA = "captcha"
+CONF_CODE = "code"
 
 # Where the account lives. The Xiaomi app calls mainland China the default, and
 # it is served from the bare host; every other region is a subdomain.
@@ -92,6 +95,8 @@ CREDENTIALS_SCHEMA = vol.Schema(
 
 CAPTCHA_SCHEMA = vol.Schema({vol.Required(CONF_CAPTCHA): cv.string})
 
+CODE_SCHEMA = vol.Schema({vol.Required(CONF_CODE): cv.string})
+
 TOKEN_SCHEMA = vol.Schema(
     {
         vol.Required(CONF_USER_ID): cv.string,
@@ -110,7 +115,7 @@ class Ec2ConfigFlow(ConfigFlow, domain=DOMAIN):
         self._cloud: XiaomiCloud | None = None
         self._username: str | None = None
         self._password: str | None = None
-        self._two_factor_url: str | None = None
+        self._code_destination: str = ""
         self._captcha_image: str | None = None
         self._country: str = "cn"
         self._gateways: list[CloudDevice] = []
@@ -206,32 +211,33 @@ class Ec2ConfigFlow(ConfigFlow, domain=DOMAIN):
             description_placeholders={"image": self._captcha_image or ""},
         )
 
-    async def async_step_two_factor(
+    async def async_step_code(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Wait for the user to verify in their browser, then retry.
+        """Take the code Xiaomi has already sent.
 
-        We deliberately do not try to submit the code ourselves: Xiaomi's
-        verification endpoints differ between phone and email accounts and are
-        brittle to drive. Letting the user complete it in a browser works for
-        both, and Xiaomi then trusts the public IP.
+        No browser trip: the verification is started and the code requested
+        from here, so all that is left is to type in what arrived. Sending the
+        user to a web page instead completes a sign-in for the browser and
+        leaves this one exactly where it was, which is why that approach
+        looped.
         """
         errors: dict[str, str] = {}
 
         if user_input is not None:
-            result = await self._async_login()
+            result = await self._async_login(verify_code=user_input[CONF_CODE].strip())
             if result is not None:
                 return result
-            nxt = await self._async_next("two_factor")
+            nxt = await self._async_next("code")
             if nxt is not None:
                 return nxt
             errors["base"] = self._last_error
 
         return self.async_show_form(
-            step_id="two_factor",
-            data_schema=vol.Schema({}),
+            step_id="code",
+            data_schema=CODE_SCHEMA,
             errors=errors,
-            description_placeholders={"url": self._two_factor_url or ""},
+            description_placeholders={"destination": self._code_destination},
         )
 
     async def async_step_reauth(
@@ -261,9 +267,9 @@ class Ec2ConfigFlow(ConfigFlow, domain=DOMAIN):
             except CaptchaRequired as err:
                 self._captcha_image = err.image_data_uri
                 return await self.async_step_captcha()
-            except TwoFactorRequired as err:
-                self._two_factor_url = err.notification_url
-                return await self.async_step_two_factor()
+            except VerificationRequired as err:
+                self._code_destination = err.destination
+                return await self.async_step_code()
             except XiaomiCloudError as err:
                 _LOGGER.debug("Re-authentication failed: %s", err)
                 errors["base"] = "invalid_auth"
@@ -334,8 +340,8 @@ class Ec2ConfigFlow(ConfigFlow, domain=DOMAIN):
         """
         if self._last_error == "captcha_required" and current != "captcha":
             return await self.async_step_captcha()
-        if self._last_error == "two_factor_pending" and current != "two_factor":
-            return await self.async_step_two_factor()
+        if self._last_error == "code_required" and current != "code":
+            return await self.async_step_code()
         return None
 
     def _async_cloud(self) -> XiaomiCloud:
@@ -353,7 +359,7 @@ class Ec2ConfigFlow(ConfigFlow, domain=DOMAIN):
         return self._cloud
 
     async def _async_login(
-        self, captcha_code: str | None = None
+        self, captcha_code: str | None = None, verify_code: str | None = None
     ) -> ConfigFlowResult | None:
         """Try the username/password login.
 
@@ -365,7 +371,12 @@ class Ec2ConfigFlow(ConfigFlow, domain=DOMAIN):
         assert self._username is not None and self._password is not None
         cloud = self._async_cloud()
         try:
-            await cloud.async_login(self._username, self._password, captcha_code)
+            if captcha_code is not None:
+                await cloud.async_login_with_captcha(captcha_code)
+            elif verify_code is not None:
+                await cloud.async_login_with_verify(verify_code)
+            else:
+                await cloud.async_login(self._username, self._password)
         except CaptchaRequired as err:
             # Logged because a challenge is not a failure, and silence here
             # left nothing in the log to explain why sign-in kept looping.
@@ -373,10 +384,10 @@ class Ec2ConfigFlow(ConfigFlow, domain=DOMAIN):
             self._captcha_image = err.image_data_uri
             self._last_error = "captcha_required"
             return None
-        except TwoFactorRequired as err:
-            _LOGGER.debug("Xiaomi wants verification at %s", err.notification_url)
-            self._two_factor_url = err.notification_url
-            self._last_error = "two_factor_pending"
+        except VerificationRequired as err:
+            _LOGGER.debug("Xiaomi sent a verification code to %s", err.destination)
+            self._code_destination = err.destination
+            self._last_error = "code_required"
             return None
         except XiaomiCloudError as err:
             _LOGGER.debug("Login failed: %s", err)
