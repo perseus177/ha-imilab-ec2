@@ -1,0 +1,19 @@
+IMILAB / Mijia EC2 cameras for Home Assistant
+Copyright (c) 2026 perseus177
+
+This product distributes, as release artifacts, binaries built from go2rtc:
+
+    go2rtc - https://github.com/AlexxIT/go2rtc
+    Copyright (c) 2022 Alexey Khit
+    Licensed under the MIT License
+
+Those binaries are built from a fork that adds support for IMILAB / Mijia EC2
+battery cameras (chuangmi.gateway.ipc011). The change is offered upstream as
+AlexxIT/go2rtc#2446; until it is merged, this project ships its own build so
+that users do not depend on that decision.
+
+    Fork: https://github.com/perseus177/go2rtc (branch xiaomi-ec2-support)
+
+No go2rtc source is vendored into this repository. The binaries are produced by
+.github/workflows/build-go2rtc.yml directly from the fork, and the integration
+verifies the published SHA-256 checksum before executing one.

@@ -1,0 +1,12 @@
+{
+  "domain": "imilab_ec2",
+  "name": "IMILAB / Mijia EC2 cameras",
+  "codeowners": ["@perseus177"],
+  "config_flow": true,
+  "documentation": "https://github.com/perseus177/ha-imilab-ec2",
+  "integration_type": "hub",
+  "iot_class": "local_polling",
+  "issue_tracker": "https://github.com/perseus177/ha-imilab-ec2/issues",
+  "requirements": [],
+  "version": "0.1.0"
+}

@@ -1,0 +1,42 @@
+name: Validate
+
+on:
+  push:
+  pull_request:
+  schedule:
+    # Home Assistant and HACS both move; a monthly run catches a manifest that
+    # has quietly gone out of spec rather than finding out from a user.
+    - cron: "0 4 1 * *"
+  workflow_dispatch:
+
+jobs:
+  hassfest:
+    name: Home Assistant manifest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: home-assistant/actions/hassfest@master
+
+  hacs:
+    name: HACS
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hacs/action@main
+        with:
+          category: integration
+          # The brands repository only lists integrations shipped with Home
+          # Assistant; a custom one legitimately has no entry there.
+          ignore: brands
+
+  ruff:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/ruff-action@v3
+        with:
+          args: check --output-format=github
+      - uses: astral-sh/ruff-action@v3
+        with:
+          args: format --check

@@ -1,0 +1,143 @@
+name: Build go2rtc
+
+# Builds the patched go2rtc that this integration ships and publishes it as a
+# release. The integration downloads the binary from here at runtime, so the
+# tag and asset names below are a contract with `go2rtc_manager.py`:
+#
+#   tag    go2rtc-<BINARY_VERSION>      e.g. go2rtc-1.9.14-ec2.1
+#   asset  go2rtc-<arch>                arm64 | amd64 | armv7
+#
+# Building here rather than by hand is the whole point: the binary must be
+# reproducible from source by anyone, and must not depend on one particular
+# laptop being switched on.
+
+on:
+  workflow_dispatch:
+    inputs:
+      go2rtc_ref:
+        description: Commit or branch of the patched go2rtc fork to build
+        required: true
+        default: 142a357452ccd6cfce86a4a583e2753fdb268507
+      version:
+        description: Release version (tag becomes go2rtc-<version>)
+        required: true
+        default: 1.9.14-ec2.1
+      prerelease:
+        description: Mark the release as a pre-release
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  # The fork carrying the EC2 support that upstream has not merged
+  # (AlexxIT/go2rtc#2446).
+  GO2RTC_REPO: perseus177/go2rtc
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Home Assistant OS on ODROID/Raspberry Pi
+          - arch: arm64
+            goarch: arm64
+            goarm: ""
+          # Intel/AMD boxes and most VMs
+          - arch: amd64
+            goarch: amd64
+            goarm: ""
+          # 32-bit Raspberry Pi installs
+          - arch: armv7
+            goarch: arm
+            goarm: "7"
+
+    steps:
+      - name: Check out the patched go2rtc
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.GO2RTC_REPO }}
+          ref: ${{ inputs.go2rtc_ref }}
+          # Full history: a shallow clone cannot resolve an arbitrary commit,
+          # and the checkout then quietly lands on the default branch.
+          fetch-depth: 0
+          path: go2rtc
+
+      # A shallow clone or a wrong ref silently leaves you on the fork's
+      # unpatched master, and the build still succeeds -- you get a binary that
+      # looks fine and cannot talk to the cameras. Fail loudly instead.
+      - name: Verify the EC2 patch is present
+        working-directory: go2rtc
+        run: |
+          set -eux
+          test "$(git rev-parse HEAD)" = "$(git rev-parse '${{ inputs.go2rtc_ref }}')" \
+            || { echo "::error::checked-out commit is not ${{ inputs.go2rtc_ref }}"; exit 1; }
+          grep -q 'ModelIMILABEC2' pkg/xiaomi/legacy/client.go \
+            || { echo "::error::EC2 patch missing from pkg/xiaomi/legacy/client.go"; exit 1; }
+          grep -q 'chuangmi.gateway.ipc011' pkg/xiaomi/legacy/client.go \
+            || { echo "::error::EC2 gateway model missing"; exit 1; }
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go2rtc/go.mod
+          cache-dependency-path: go2rtc/go.sum
+
+      - name: Build
+        working-directory: go2rtc
+        env:
+          # Static build: the Home Assistant core container is Alpine/musl, and
+          # a cgo-linked binary would not run there.
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+        run: |
+          set -eux
+          go build -trimpath -buildvcs=false -ldflags="-s -w" -o "go2rtc-${{ matrix.arch }}" .
+          file "go2rtc-${{ matrix.arch }}"
+          sha256sum "go2rtc-${{ matrix.arch }}" | tee "go2rtc-${{ matrix.arch }}.sha256"
+
+      - name: Smoke test the native build
+        if: matrix.arch == 'amd64'
+        working-directory: go2rtc
+        run: ./go2rtc-amd64 --version
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: go2rtc-${{ matrix.arch }}
+          path: |
+            go2rtc/go2rtc-${{ matrix.arch }}
+            go2rtc/go2rtc-${{ matrix.arch }}.sha256
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Collect binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: go2rtc-${{ inputs.version }}
+          name: go2rtc ${{ inputs.version }}
+          prerelease: ${{ inputs.prerelease }}
+          files: dist/*
+          body: |
+            Patched go2rtc used by the IMILAB / Mijia EC2 integration.
+
+            Built from [`${{ env.GO2RTC_REPO }}`](https://github.com/${{ env.GO2RTC_REPO }})
+            at `${{ inputs.go2rtc_ref }}`, which carries the EC2 camera support
+            offered upstream as [AlexxIT/go2rtc#2446](https://github.com/AlexxIT/go2rtc/pull/2446).
+
+            The integration downloads the binary matching the host architecture
+            and verifies it against the published `.sha256` before running it.

@@ -1,0 +1,75 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "IMILAB / Mijia EC2",
+        "description": "Sign in to the Xiaomi account that owns the cameras. Your gateways are then found automatically.",
+        "menu_options": {
+          "credentials": "Sign in with username and password",
+          "token": "Use a user ID and passToken (advanced)"
+        }
+      },
+      "credentials": {
+        "title": "Xiaomi account",
+        "description": "Use the account that OWNS the cameras. An account they are only shared with is never issued the P2P keys needed to stream, so it cannot work.",
+        "data": {
+          "username": "Xiaomi ID, email or phone number",
+          "password": "Password"
+        }
+      },
+      "two_factor": {
+        "title": "Verification required",
+        "description": "Xiaomi wants to verify this sign-in.\n\n1. Open this link and complete the verification:\n{url}\n\n2. Come back here and press Submit.\n\n**Important:** open the link from a device on the same network as Home Assistant. Xiaomi ties this to your public IP address, so verifying from somewhere else will not unlock the sign-in."
+      },
+      "token": {
+        "title": "User ID and passToken",
+        "description": "For accounts where a password sign-in will not complete. The passToken looks like V1:… and is what an existing working setup already stores.",
+        "data": {
+          "user_id": "Xiaomi user ID",
+          "pass_token": "passToken"
+        }
+      },
+      "select": {
+        "title": "Choose a gateway",
+        "description": "More than one EC2 gateway is on this account. Add one now; run this again to add the next.",
+        "data": {
+          "gateway": "Gateway"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Sign in again",
+        "description": "Xiaomi has invalidated the stored token, so the cameras have stopped streaming. Signing in again restores them.",
+        "data": {
+          "username": "Xiaomi ID, email or phone number",
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Xiaomi rejected those credentials.",
+      "cannot_connect": "Could not reach the Xiaomi cloud.",
+      "two_factor_pending": "Verification is not complete yet. Finish it in your browser, then press Submit again."
+    },
+    "abort": {
+      "cannot_connect": "Could not reach the Xiaomi cloud to list your devices.",
+      "already_configured": "Every gateway on this account is already set up.",
+      "no_gateways": "This account owns no EC2 gateways. Make sure you signed in with the account that OWNS the cameras, not one they are shared with.",
+      "no_address": "The gateway has no reachable address. It must be on the same network as Home Assistant.",
+      "gateway_gone": "That gateway is no longer available.",
+      "reauth_successful": "Signed in again successfully."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Streaming ports",
+        "description": "RTSP must stay reachable from your network if external players (for example Kodi via IPTV Simple) pull these streams. Binding it to 127.0.0.1 will silently break them.",
+        "data": {
+          "rtsp_listen": "RTSP listen address",
+          "api_listen": "API listen address",
+          "webrtc_listen": "WebRTC listen address"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,338 @@
+"""Xiaomi account client: log in, then ask which devices the account owns.
+
+Why this exists at all: these cameras cannot stream without the cloud. Every
+connection fetches fresh P2P keys from `/device/devicepass`, so an account
+credential is mandatory. Once we are talking to the cloud anyway, it will also
+tell us every gateway on the account -- its address, its device id and its local
+miio token -- which is far better than asking a human to type them in.
+
+The login is the standard Xiaomi `serviceLogin` dance:
+
+    GET  /pass/serviceLogin            -> _sign
+    POST /pass/serviceLoginAuth2       -> ssecurity + passToken, or a 2FA demand
+    GET  <location>                    -> serviceToken cookie
+    POST /app/home/device_list         -> the devices
+
+Responses are prefixed with a `&&&START&&&` guard that has to be stripped before
+parsing.
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import hmac
+import json
+import logging
+import os
+import time
+from dataclasses import dataclass
+from typing import Any
+
+import aiohttp
+
+_LOGGER = logging.getLogger(__name__)
+
+ACCOUNT_BASE = "https://account.xiaomi.com"
+STS_CALLBACK = "https://sts.api.io.mi.com/sts"
+JSON_GUARD = "&&&START&&&"
+SID = "xiaomiio"
+AGENT = (
+    "Android-7.1.1-1.0.0-ONEPLUS A3010-136-",
+    "APP/xiaomi.smarthome APPV/62830",
+)
+TIMEOUT = 20
+
+# Only these regions have their own API host. Everything else -- including
+# mainland China, and including an empty region -- lives on the bare host.
+REGION_HOSTS = {"de", "i2", "ru", "sg", "us"}
+
+GATEWAY_MODELS = {"chuangmi.gateway.ipc011"}
+
+
+class XiaomiCloudError(Exception):
+    """Login or an API call failed."""
+
+
+class TwoFactorRequired(XiaomiCloudError):
+    """Xiaomi wants a verification code before it will finish the login."""
+
+    def __init__(self, notification_url: str) -> None:
+        super().__init__("two-factor verification required")
+        self.notification_url = notification_url
+
+
+@dataclass(frozen=True)
+class CloudDevice:
+    """One device as the account sees it."""
+
+    did: str
+    name: str
+    model: str
+    local_ip: str | None
+    token: str | None
+    mac: str | None
+
+    @property
+    def is_ec2_gateway(self) -> bool:
+        return self.model in GATEWAY_MODELS
+
+
+def api_host(region: str | None) -> str:
+    """Map a region to its API host."""
+    if region and region.lower() in REGION_HOSTS:
+        return f"https://{region.lower()}.api.io.mi.com/app"
+    return "https://api.io.mi.com/app"
+
+
+def _strip_guard(text: str) -> Any:
+    if text.startswith(JSON_GUARD):
+        text = text[len(JSON_GUARD) :]
+    try:
+        return json.loads(text)
+    except ValueError as err:
+        raise XiaomiCloudError("unparseable response from Xiaomi") from err
+
+
+class XiaomiCloud:
+    """Minimal Xiaomi cloud client."""
+
+    def __init__(self, session: aiohttp.ClientSession) -> None:
+        self._session = session
+        self._device_id = "".join(
+            f"{b:02x}" for b in os.urandom(8)
+        )  # stable per flow is enough
+        self.user_id: str | None = None
+        self.pass_token: str | None = None
+        self.ssecurity: str | None = None
+        self._service_token: str | None = None
+
+    # -- login ---------------------------------------------------------------
+
+    async def async_login(self, username: str, password: str) -> None:
+        """Log in with a username and password.
+
+        Raises `TwoFactorRequired` when Xiaomi wants a code; call
+        `async_login_with_token` afterwards once the user has verified.
+        """
+        sign = await self._async_login_sign()
+        hashed = hashlib.md5(password.encode()).hexdigest().upper()  # noqa: S324
+
+        payload = {
+            "sid": SID,
+            "hash": hashed,
+            "callback": STS_CALLBACK,
+            "qs": "%3Fsid%3Dxiaomiio%26_json%3Dtrue",
+            "user": username,
+            "_json": "true",
+        }
+        if sign:
+            payload["_sign"] = sign
+
+        data = await self._async_post_form(
+            f"{ACCOUNT_BASE}/pass/serviceLoginAuth2", payload
+        )
+        await self._async_finish_login(data)
+
+    async def async_login_with_token(self, user_id: str, pass_token: str) -> None:
+        """Log in using a passToken -- no password, no verification code.
+
+        This is the same path go2rtc uses, and the reason a working setup keeps
+        working without ever storing a password.
+        """
+        cookies = {"userId": user_id, "passToken": pass_token}
+        data = await self._async_get_json(
+            f"{ACCOUNT_BASE}/pass/serviceLogin?sid={SID}&_json=true", cookies=cookies
+        )
+        await self._async_finish_login(data)
+
+    async def _async_login_sign(self) -> str | None:
+        data = await self._async_get_json(
+            f"{ACCOUNT_BASE}/pass/serviceLogin?sid={SID}&_json=true"
+        )
+        return data.get("_sign")
+
+    async def _async_finish_login(self, data: dict[str, Any]) -> None:
+        """Consume a serviceLogin response and pick up the session."""
+        if not data.get("ssecurity"):
+            notification = data.get("notificationUrl")
+            if notification:
+                # Account is protected by 2FA. The caller has to send the user
+                # through the verification page before we can continue.
+                raise TwoFactorRequired(notification)
+            code = data.get("code")
+            desc = data.get("desc") or data.get("description") or "login rejected"
+            raise XiaomiCloudError(f"{desc} (code {code})")
+
+        self.ssecurity = data["ssecurity"]
+        self.user_id = str(data.get("userId") or "")
+        self.pass_token = data.get("passToken")
+
+        location = data.get("location")
+        if not location:
+            raise XiaomiCloudError("login response carried no location")
+
+        # Following the location is what mints the serviceToken cookie.
+        try:
+            async with self._session.get(
+                location,
+                timeout=aiohttp.ClientTimeout(total=TIMEOUT),
+                allow_redirects=True,
+            ) as response:
+                for cookie in response.cookies.values():
+                    if cookie.key == "serviceToken":
+                        self._service_token = cookie.value
+                if self._service_token is None:
+                    filtered = self._session.cookie_jar.filter_cookies(
+                        aiohttp.helpers.URL(location)
+                    )
+                    token = filtered.get("serviceToken")
+                    self._service_token = token.value if token else None
+        except aiohttp.ClientError as err:
+            raise XiaomiCloudError(f"could not complete login: {err}") from err
+
+        if not self._service_token:
+            raise XiaomiCloudError("login did not yield a serviceToken")
+
+    # -- signed API ----------------------------------------------------------
+
+    async def async_device_list(self, region: str | None = None) -> list[CloudDevice]:
+        """Every device on the account, in one call."""
+        payload = json.dumps(
+            {"getVirtualModel": False, "getHuamiDevices": 0}, separators=(",", ":")
+        )
+        result = await self._async_signed_post("/home/device_list", payload, region)
+        devices = (result or {}).get("list") or []
+        return [
+            CloudDevice(
+                did=str(item.get("did", "")),
+                name=str(item.get("name", "")),
+                model=str(item.get("model", "")),
+                local_ip=item.get("localip") or None,
+                token=item.get("token") or None,
+                mac=item.get("mac") or None,
+            )
+            for item in devices
+            if isinstance(item, dict)
+        ]
+
+    async def async_find_gateways(self) -> list[CloudDevice]:
+        """EC2 gateways on the account, trying every plausible region.
+
+        The owning account here sits in the default (mainland China) region,
+        where the region string is empty -- not `de`. Asking the wrong host
+        returns an empty list rather than an error, so all of them get a turn.
+        """
+        seen: dict[str, CloudDevice] = {}
+        for region in ("", *sorted(REGION_HOSTS)):
+            try:
+                devices = await self.async_device_list(region or None)
+            except XiaomiCloudError as err:
+                _LOGGER.debug("device_list failed for region %r: %s", region, err)
+                continue
+            for device in devices:
+                if device.is_ec2_gateway and device.did not in seen:
+                    seen[device.did] = device
+            if seen:
+                # Found them; no need to keep sweeping regions.
+                break
+        return list(seen.values())
+
+    async def _async_signed_post(
+        self, path: str, data: str, region: str | None
+    ) -> dict[str, Any]:
+        if not self.ssecurity or not self.user_id or not self._service_token:
+            raise XiaomiCloudError("not logged in")
+
+        nonce = _gen_nonce()
+        signed = _signed_nonce(self.ssecurity, nonce)
+        signature = _sign(path, signed, nonce, data)
+
+        url = api_host(region) + path
+        headers = {
+            "User-Agent": "".join(AGENT),
+            "x-xiaomi-protocal-flag-cli": "PROTOCAL-HTTP2",
+            "Content-Type": "application/x-www-form-urlencoded",
+        }
+        cookies = {
+            "userId": self.user_id,
+            "serviceToken": self._service_token,
+            "locale": "en_GB",
+        }
+        form = {"signature": signature, "_nonce": nonce, "data": data}
+
+        try:
+            async with self._session.post(
+                url,
+                data=form,
+                headers=headers,
+                cookies=cookies,
+                timeout=aiohttp.ClientTimeout(total=TIMEOUT),
+            ) as response:
+                text = await response.text()
+        except aiohttp.ClientError as err:
+            raise XiaomiCloudError(f"{path}: {err}") from err
+
+        parsed = _strip_guard(text)
+        if not isinstance(parsed, dict):
+            raise XiaomiCloudError(f"{path}: unexpected response")
+        return parsed.get("result") or {}
+
+    # -- plumbing ------------------------------------------------------------
+
+    async def _async_get_json(
+        self, url: str, cookies: dict[str, str] | None = None
+    ) -> dict[str, Any]:
+        try:
+            async with self._session.get(
+                url,
+                cookies=cookies,
+                headers={"User-Agent": "".join(AGENT)},
+                timeout=aiohttp.ClientTimeout(total=TIMEOUT),
+            ) as response:
+                text = await response.text()
+        except aiohttp.ClientError as err:
+            raise XiaomiCloudError(f"{url}: {err}") from err
+        parsed = _strip_guard(text)
+        if not isinstance(parsed, dict):
+            raise XiaomiCloudError("unexpected login response")
+        return parsed
+
+    async def _async_post_form(
+        self, url: str, payload: dict[str, str]
+    ) -> dict[str, Any]:
+        try:
+            async with self._session.post(
+                url,
+                data=payload,
+                headers={
+                    "User-Agent": "".join(AGENT),
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
+                cookies={"sdkVersion": "3.9", "deviceId": self._device_id},
+                timeout=aiohttp.ClientTimeout(total=TIMEOUT),
+            ) as response:
+                text = await response.text()
+        except aiohttp.ClientError as err:
+            raise XiaomiCloudError(f"{url}: {err}") from err
+        parsed = _strip_guard(text)
+        if not isinstance(parsed, dict):
+            raise XiaomiCloudError("unexpected login response")
+        return parsed
+
+
+def _gen_nonce() -> str:
+    return base64.b64encode(
+        os.urandom(8) + int(time.time() / 60).to_bytes(4, "big")
+    ).decode()
+
+
+def _signed_nonce(ssecurity: str, nonce: str) -> str:
+    digest = hashlib.sha256(base64.b64decode(ssecurity) + base64.b64decode(nonce))
+    return base64.b64encode(digest.digest()).decode()
+
+
+def _sign(path: str, signed: str, nonce: str, data: str) -> str:
+    message = "&".join([path, signed, nonce, f"data={data}"])
+    mac = hmac.new(base64.b64decode(signed), message.encode(), hashlib.sha256)
+    return base64.b64encode(mac.digest()).decode()
