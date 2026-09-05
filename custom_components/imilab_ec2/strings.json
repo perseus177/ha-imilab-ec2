@@ -63,7 +63,8 @@
       "captcha_wrong": "That code was not accepted. A new image has been issued - try again.",
       "captcha_required": "Xiaomi is asking for a captcha.",
       "code_required": "Xiaomi wants a verification code.",
-      "invalid_code": "That code was not accepted."
+      "invalid_code": "That code was not accepted.",
+      "code_quota": "Xiaomi will not send another verification code right now - too many have been requested. Retrying keeps the limit alive. Go back and use \"Use a user ID and passToken (advanced)\" instead: it needs no code and is not affected."
     },
     "abort": {
       "cannot_connect": "Could not reach the Xiaomi cloud to list your devices.",

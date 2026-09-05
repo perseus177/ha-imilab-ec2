@@ -80,6 +80,19 @@ class CaptchaRequired(XiaomiCloudError):
         self.image_data_uri = image_data_uri
 
 
+class CodeQuotaExhausted(XiaomiCloudError):
+    """Xiaomi will not send any more verification codes for now (code 70022).
+
+    Not a fault in the sign-in and not fixable in code. It appears to be a
+    rolling window rather than a calendar day, so retrying keeps it alive --
+    measured across two days of attempts. The passToken route needs no code and
+    is unaffected.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+
+
 class VerificationRequired(XiaomiCloudError):
     """Xiaomi has sent a code by email or SMS and is waiting for it.
 
@@ -412,8 +425,8 @@ class XiaomiCloud:
         if captcha:
             await self._async_get_captcha(captcha)
         if sent.get("code") not in (0, None):
-            # 70022 is the daily cap on verification codes. It is not a fault
-            # in the sign-in; nothing here will get past it until it resets.
+            if sent.get("code") == 70022:
+                raise CodeQuotaExhausted(_reason(sent))
             raise XiaomiCloudError(_reason(sent))
 
         raise VerificationRequired(
@@ -650,6 +663,7 @@ class XiaomiCloud:
 
 __all__ = [
     "CloudDevice",
+    "CodeQuotaExhausted",
     "VerificationRequired",
     "XiaomiCloud",
     "XiaomiCloudError",

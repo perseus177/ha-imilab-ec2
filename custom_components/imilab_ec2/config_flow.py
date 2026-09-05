@@ -52,6 +52,7 @@ from .miio import MiioError, MiioGateway
 from .xiaomi_cloud import (
     CaptchaRequired,
     CloudDevice,
+    CodeQuotaExhausted,
     VerificationRequired,
     XiaomiCloud,
     XiaomiCloudError,
@@ -383,6 +384,15 @@ class Ec2ConfigFlow(ConfigFlow, domain=DOMAIN):
             _LOGGER.debug("Xiaomi issued a captcha")
             self._captcha_image = err.image_data_uri
             self._last_error = "captcha_required"
+            return None
+        except CodeQuotaExhausted as err:
+            _LOGGER.warning(
+                "Xiaomi will not send another verification code: %s. "
+                "Retrying keeps this alive; use the user ID and passToken route "
+                "instead, which needs no code",
+                err,
+            )
+            self._last_error = "code_quota"
             return None
         except VerificationRequired as err:
             _LOGGER.debug("Xiaomi sent a verification code to %s", err.destination)
