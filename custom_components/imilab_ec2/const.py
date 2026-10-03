@@ -25,6 +25,9 @@ CONF_GATEWAY_HOST: Final = "gateway_host"
 CONF_GATEWAY_TOKEN: Final = "gateway_token"
 CONF_GATEWAY_DID: Final = "gateway_did"
 CONF_CAMERAS: Final = "cameras"
+# Where the account lives ("cn" = mainland China, the bare API host). Needed at
+# runtime for calls the cloud relays to the gateway.
+CONF_COUNTRY: Final = "country"
 
 # --- options -----------------------------------------------------------------
 
@@ -52,6 +55,13 @@ DEFAULT_WEBRTC_LISTEN: Final = ":8557"
 # Polling costs the camera nothing -- it answers from the mains-powered gateway.
 FAST_INTERVAL: Final = 15
 SLOW_INTERVAL: Final = 900
+# When the gateway rejects its local token, the same state is read through the
+# cloud instead -- politely, once a minute -- and the LAN is tried again only
+# every half hour, since each failed attempt costs ~20 s of timeouts.
+CLOUD_INTERVAL: Final = 60
+LOCAL_RETRY_INTERVAL: Final = 1800
+# How far back to look for the last motion event.
+EVENT_LOOKBACK_DAYS: Final = 7
 
 # How often to confirm the account token still works. Cheap, and it catches a
 # rotation before anyone notices the cameras are dark.

@@ -11,12 +11,14 @@ from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers.aiohttp_client import async_create_clientsession
 from homeassistant.helpers.event import async_track_time_interval
 
 from .auth import TokenRenewer
 from .const import (
     CONF_API_LISTEN,
     CONF_CAMERAS,
+    CONF_COUNTRY,
     CONF_GATEWAY_DID,
     CONF_GATEWAY_HOST,
     CONF_GATEWAY_TOKEN,
@@ -31,13 +33,14 @@ from .const import (
     GATEWAY_MODEL,
     TOKEN_CHECK_INTERVAL,
 )
-from .coordinator import Ec2Coordinator, Ec2RuntimeData, static_camera
+from .coordinator import CloudSource, Ec2Coordinator, Ec2RuntimeData, static_camera
 from .go2rtc_manager import Go2rtcError, Go2rtcManager, build_streams
 from .miio import MiioError, MiioGateway
+from .xiaomi_cloud import XiaomiCloud
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS = [Platform.CAMERA]
+PLATFORMS = [Platform.CAMERA, Platform.SENSOR]
 
 type Ec2ConfigEntry = ConfigEntry[Ec2RuntimeData]
 
@@ -55,8 +58,25 @@ async def async_setup_entry(hass: HomeAssistant, entry: Ec2ConfigEntry) -> bool:
         static_camera(camera["mac"], camera.get("name", camera["mac"]))
         for camera in entry.data.get(CONF_CAMERAS, [])
     ]
+    # The cloud relays get_camera_list to gateways that reject their local
+    # token, and it is the only record of when motion happened.
+    session = async_create_clientsession(hass)
+    cloud = CloudSource(
+        cloud_factory=lambda: XiaomiCloud(session),
+        credentials=lambda: (entry.data[CONF_USER_ID], entry.data[CONF_PASS_TOKEN]),
+        # Entries from before the region was stored: mainland China is both
+        # the app's default and the bare API host.
+        country=entry.data.get(CONF_COUNTRY) or "cn",
+        did=str(entry.data[CONF_GATEWAY_DID]),
+    )
     coordinator = Ec2Coordinator(
-        hass, host, gateway, fallback, entry.data.get(CONF_GATEWAY_DID)
+        hass,
+        host,
+        gateway,
+        fallback,
+        gateway_did=entry.data.get(CONF_GATEWAY_DID),
+        cloud=cloud,
+        gateway_name=entry.title,
     )
     await coordinator.async_config_entry_first_refresh()
 
@@ -73,9 +93,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: Ec2ConfigEntry) -> bool:
     dr.async_get(hass).async_get_or_create(
         config_entry_id=entry.entry_id,
         identifiers={(DOMAIN, gateway_id)},
-        name=entry.title,
+        # "gateway" in the name and the model, so it is never mistaken for the
+        # camera it serves.
+        name=f"{entry.title} gateway",
         manufacturer="IMILAB / Xiaomi",
-        model=GATEWAY_MODEL,
+        model="EC2 gateway",
+        model_id=GATEWAY_MODEL,
     )
 
     entry.runtime_data = Ec2RuntimeData(

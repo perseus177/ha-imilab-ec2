@@ -53,6 +53,13 @@ async def async_get_config_entry_diagnostics(
         "last_update_success": coordinator.last_update_success,
         "last_error": coordinator.last_error,
         "diagnosis": coordinator.diagnosis,
+        "source": coordinator.source,
+        "cloud_error": coordinator.cloud_error,
+        "last_motion": coordinator.last_motion.isoformat()
+        if coordinator.last_motion
+        else None,
+        "last_event": coordinator.last_event,
+        "event_reply": str(coordinator.event_reply)[:2000],
         "cameras": [asdict(camera) for camera in (coordinator.data or {}).values()],
     }
     data["go2rtc"] = {

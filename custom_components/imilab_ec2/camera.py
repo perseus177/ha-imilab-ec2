@@ -28,10 +28,26 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN, QUALITY_LABELS, STREAM_QUALITIES
 from .coordinator import Ec2Coordinator, Ec2RuntimeData
+from .miio import CameraInfo
 
 _LOGGER = logging.getLogger(__name__)
 
 SNAPSHOT_TIMEOUT = 10
+
+
+def camera_device_info(
+    data: Ec2RuntimeData, slug: str, camera: CameraInfo | None
+) -> DeviceInfo:
+    """The camera's device, shared by its camera and sensor entities."""
+    return DeviceInfo(
+        identifiers={(DOMAIN, slug)},
+        name=data.coordinator.name_for(slug),
+        manufacturer="IMILAB / Xiaomi",
+        model="EC2 camera",
+        model_id="CMSXJ11A",
+        sw_version=camera.version if camera else None,
+        via_device=(DOMAIN, data.gateway_id),
+    )
 
 
 @dataclass(frozen=True)
@@ -92,15 +108,7 @@ class Ec2Camera(CoordinatorEntity[Ec2Coordinator], Camera):
 
     @property
     def device_info(self) -> DeviceInfo:
-        camera = self._camera
-        return DeviceInfo(
-            identifiers={(DOMAIN, self._camera_slug)},
-            name=camera.name if camera else self._camera_slug,
-            manufacturer="IMILAB / Xiaomi",
-            model="CMSXJ11A",
-            sw_version=camera.version if camera else None,
-            via_device=(DOMAIN, self._data.gateway_id),
-        )
+        return camera_device_info(self._data, self._camera_slug, self._camera)
 
     @property
     def extra_state_attributes(self) -> dict[str, str]:

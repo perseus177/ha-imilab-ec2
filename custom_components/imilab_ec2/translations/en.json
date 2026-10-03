@@ -125,5 +125,15 @@
       "invalid_listen": "Use the form :port or address:port, for example :8556.",
       "duplicate_port": "Each of the three needs its own port."
     }
+  },
+  "entity": {
+    "sensor": {
+      "wifi": {
+        "name": "WiFi signal"
+      },
+      "last_motion": {
+        "name": "Last motion"
+      }
+    }
   }
 }

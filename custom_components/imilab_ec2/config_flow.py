@@ -159,7 +159,8 @@ def parse_cameras(text: str) -> list[dict[str, str]] | None:
         if mac in seen:
             continue
         seen.add(mac)
-        cameras.append({"mac": mac, "name": name.strip() or f"EC2 camera {mac[-4:]}"})
+        # No name: the camera is then named after its gateway.
+        cameras.append({"mac": mac, "name": name.strip()})
     return cameras or None
 
 
@@ -652,6 +653,7 @@ class Ec2ConfigFlow(ConfigFlow, domain=DOMAIN):
             CONF_USER_ID: self._cloud.user_id,
             CONF_PASS_TOKEN: self._cloud.pass_token,
             CONF_CAMERAS: cameras,
+            CONF_COUNTRY: gateway.country or self._country,
         }
         if self._username and self._password:
             # Kept so an expired token renews itself. Without these, a rotation

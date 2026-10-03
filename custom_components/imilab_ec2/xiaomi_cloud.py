@@ -237,7 +237,13 @@ def _generate_nonce(millis: int) -> str:
 
 
 def _enc_signature(url: str, method: str, signed_nonce: str, params: dict) -> str:
-    parts = [method.upper(), url.split("com")[1].replace("/app/", "/")]
+    # The signed path drops a leading /app only. Splitting the URL on "com"
+    # (as before) breaks on hosts and paths that contain it, such as
+    # business.smartcamera.api.io.mi.com/common/app/get/eventlist.
+    path = URL(url).path
+    if path.startswith("/app/"):
+        path = path[4:]
+    parts = [method.upper(), path]
     parts.extend(f"{k}={v}" for k, v in params.items())
     parts.append(signed_nonce)
     return base64.b64encode(hashlib.sha1("&".join(parts).encode()).digest()).decode()
@@ -650,14 +656,16 @@ class XiaomiCloud:
         )
         return base64.b64encode(digest.digest()).decode()
 
-    async def _async_api(self, url: str, params: dict[str, str]) -> Any:
+    async def _async_api(
+        self, url: str, params: dict[str, str], method: str = "POST"
+    ) -> Any:
         """RC4-encrypted API call, the way the Mi Home app makes them."""
         if not (self.ssecurity and self.user_id and self._service_token):
             raise XiaomiCloudError("not logged in")
 
         nonce = _generate_nonce(round(time.time() * 1000))
         signed = self._signed_nonce(nonce)
-        fields = _enc_params(url, "POST", signed, nonce, dict(params), self.ssecurity)
+        fields = _enc_params(url, method, signed, nonce, dict(params), self.ssecurity)
 
         headers = {
             "Accept-Encoding": "identity",
@@ -678,7 +686,8 @@ class XiaomiCloud:
         }
 
         try:
-            async with self._session.post(
+            async with self._session.request(
+                method,
                 url,
                 params=fields,
                 headers=headers,
@@ -691,8 +700,45 @@ class XiaomiCloud:
         except aiohttp.ClientError as err:
             raise XiaomiCloudError(f"{url}: {err}") from err
 
+        if text.lstrip().startswith("{"):
+            # Errors come back as plain JSON rather than encrypted.
+            return json.loads(text)
         decoded = _decrypt_rc4(self._signed_nonce(fields["_nonce"]), text)
         return json.loads(decoded)
+
+    async def async_last_event(
+        self, country: str, did: str, model: str, since_ms: int
+    ) -> tuple[dict[str, Any] | None, Any]:
+        """The newest alarm event the cloud recorded for a camera device.
+
+        Ported from hass-xiaomi-miot, which reads Xiaomi camera events from the
+        same endpoint. Returns (event or None, raw reply) -- the raw reply is
+        for the log, since this path is not yet confirmed for this gateway.
+        """
+        host = "business.smartcamera.api.io.mi.com"
+        if country and country != "cn":
+            host = f"{country}.{host}"
+        payload = {
+            "did": did,
+            "model": model,
+            "doorBell": False,
+            "eventType": "Default",
+            "needMerge": True,
+            "sortType": "DESC",
+            "region": (country or "cn").upper(),
+            "language": "en_GB",
+            "beginTime": since_ms,
+            "endTime": int(time.time() * 1000) + 999,
+            "limit": 2,
+        }
+        reply = await self._async_api(
+            f"https://{host}/common/app/get/eventlist",
+            {"data": json.dumps(payload, separators=(",", ":"))},
+            method="GET",
+        )
+        units = ((reply or {}).get("data") or {}).get("thirdPartPlayUnits") or []
+        first = units[0] if units and isinstance(units[0], dict) else None
+        return first, reply
 
     async def async_device_rpc(
         self, country: str, did: str, method: str, params: list[Any] | None = None
