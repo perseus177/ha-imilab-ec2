@@ -72,6 +72,10 @@ _DIAL = re.compile(r"xiaomi: dial xiaomi://(?:[^@\s]*@)?[^\s?]+\?(\S+)")
 _REUSE = re.compile(r"reusing P2P credentials for did=(\d+)")
 # Fired with the did whenever a gateway's P2P key state changes.
 SIGNAL_P2P = f"{DOMAIN}_p2p_key"
+# Fired with the camera MAC when go2rtc dials a camera for a viewer.
+SIGNAL_DIAL = f"{DOMAIN}_dial"
+# A viewer going away mid-write is not a fault of anything here.
+_CLIENT_GONE = ("broken pipe", "connection reset by peer")
 
 
 def redact(line: str) -> str:
@@ -382,6 +386,8 @@ class Go2rtcManager:
                 _LOGGER.warning("go2rtc: Xiaomi cloud refused the account: %s", line)
                 if self.on_auth_failure is not None:
                     self._hass.async_create_task(self.on_auth_failure())
+            elif any(reason in line for reason in _CLIENT_GONE):
+                _LOGGER.debug("go2rtc: %s", line)
             elif " ERR " in line or " WRN " in line or "error" in line:
                 # WRN carries the stream failures (EOF, timeouts) that explain
                 # "the camera did not open"; at debug they were invisible.
@@ -405,6 +411,9 @@ class Go2rtcManager:
         query = parse_qs(match.group(1))
         did = (query.get("did") or [""])[0]
         key = (query.get("device_public") or [""])[0]
+        mac = (query.get("mac") or [""])[0]
+        if mac:
+            async_dispatcher_send(self._hass, SIGNAL_DIAL, mac)
         if not did or not key:
             return
 

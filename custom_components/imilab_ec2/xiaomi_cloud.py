@@ -400,7 +400,7 @@ class XiaomiCloud:
                 ick = response.cookies.get("ick")
                 if ick:
                     self._auth["ick"] = ick.value
-        except aiohttp.ClientError as err:
+        except (aiohttp.ClientError, TimeoutError) as err:
             raise XiaomiCloudError(f"captcha image: {err}") from err
 
         # Xiaomi serves this as application/octet-stream, so the type comes
@@ -503,7 +503,7 @@ class XiaomiCloud:
                 timeout=aiohttp.ClientTimeout(total=TIMEOUT),
             ) as response:
                 payload = await response.read()
-        except aiohttp.ClientError as err:
+        except (aiohttp.ClientError, TimeoutError) as err:
             raise XiaomiCloudError(f"QR image: {err}") from err
 
         self._long_polling_url = data["lp"]
@@ -598,7 +598,7 @@ class XiaomiCloud:
                         )
                     except ValueError:
                         pass
-        except aiohttp.ClientError as err:
+        except (aiohttp.ClientError, TimeoutError) as err:
             raise XiaomiCloudError(f"could not complete sign-in: {err}") from err
 
         if not self._service_token:
@@ -635,7 +635,7 @@ class XiaomiCloud:
             ) as response:
                 text = await response.text()
                 jar = response.cookies
-        except aiohttp.ClientError as err:
+        except (aiohttp.ClientError, TimeoutError) as err:
             raise XiaomiCloudError(f"{url}: {err}") from err
 
         if not text.startswith(JSON_GUARD):
@@ -697,7 +697,7 @@ class XiaomiCloud:
                 if response.status != 200:
                     raise XiaomiCloudError(f"{url}: HTTP {response.status}")
                 text = await response.text()
-        except aiohttp.ClientError as err:
+        except (aiohttp.ClientError, TimeoutError) as err:
             raise XiaomiCloudError(f"{url}: {err}") from err
 
         if text.lstrip().startswith("{"):

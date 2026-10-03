@@ -5,34 +5,55 @@ Home Assistant an RTSP URL and the `stream` component does the rest.
 
 The one thing that differs from a mains-powered camera, and the reason this file
 is not a five-liner: **these cameras run on a 5100 mAh battery and sleep most of
-the time.** Home Assistant happily asks a camera entity for still images to draw
-thumbnails. Answering those by opening a stream would wake the camera every few
-minutes and flatten it in days -- which is exactly why the vendor never gave
-this hardware an RTSP port. So `async_camera_image` never initiates a
-connection; it only ever returns a frame we already had.
+the time.** Home Assistant asks a camera entity for still images to draw
+thumbnails, every few minutes for as long as a dashboard shows it. Answering
+those by opening a stream would wake the camera each time and flatten it in
+days -- which is exactly why the vendor never gave this hardware an RTSP port.
+
+So a thumbnail here is **the last frame of the last time somebody actually
+watched**, kept on disk so it survives a restart. It may be two days old; that
+is the point. `async_camera_image` never starts a stream. The frame is taken
+while a stream is already running for a real viewer, which costs the camera
+nothing extra.
+
+A lesson learnt the hard way: go2rtc lists a producer for a stream after it
+was opened once, connected or not, so "the stream has a producer" does not
+mean "somebody is watching" -- a frame request on such a stream starts it.
+Live means a producer with media *and* a consumer other than us.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 
 import aiohttp
 from homeassistant.components.camera import Camera, CameraEntityFeature
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN, QUALITY_LABELS, STREAM_QUALITIES
 from .coordinator import Ec2Coordinator, Ec2RuntimeData
+from .go2rtc_manager import SIGNAL_DIAL
 from .miio import CameraInfo
 
 _LOGGER = logging.getLogger(__name__)
 
 SNAPSHOT_TIMEOUT = 10
+# After go2rtc dials the camera for a viewer, try to grab a frame at these
+# offsets (seconds). The first ~16-20 s go on waking the camera and the P2P
+# handshake, so the early attempts usually find no media yet and do nothing.
+SNAPSHOT_ATTEMPTS = (8, 20, 35, 60)
 
 
 def camera_device_info(
@@ -65,6 +86,7 @@ async def async_setup_entry(
 ) -> None:
     """Set up one camera entity per physical camera (highest quality)."""
     data: Ec2RuntimeData = entry.runtime_data
+    snapshots = Path(hass.config.path(DOMAIN)) / "snapshots"
     entities: list[Ec2Camera] = []
 
     for camera in data.coordinator.data.values():
@@ -73,7 +95,10 @@ async def async_setup_entry(
         # they just do not each need their own Home Assistant entity.
         entities.append(
             Ec2Camera(
-                data, camera.slug, _StreamRef(name=camera.slug, quality_suffix="")
+                data,
+                camera.slug,
+                _StreamRef(name=camera.slug, quality_suffix=""),
+                snapshots / f"{camera.slug}.jpg",
             )
         )
 
@@ -88,7 +113,11 @@ class Ec2Camera(CoordinatorEntity[Ec2Coordinator], Camera):
     _attr_supported_features = CameraEntityFeature.STREAM
 
     def __init__(
-        self, data: Ec2RuntimeData, camera_slug: str, stream: _StreamRef
+        self,
+        data: Ec2RuntimeData,
+        camera_slug: str,
+        stream: _StreamRef,
+        snapshot_path: Path,
     ) -> None:
         CoordinatorEntity.__init__(self, data.coordinator)
         Camera.__init__(self)
@@ -96,7 +125,10 @@ class Ec2Camera(CoordinatorEntity[Ec2Coordinator], Camera):
         self._camera_slug = camera_slug
         self._stream = stream
         self._attr_unique_id = f"{camera_slug}_camera"
+        self._snapshot_path = snapshot_path
         self._last_image: bytes | None = None
+        self._last_image_at: datetime | None = None
+        self._capture_task: asyncio.Task | None = None
 
     @property
     def _camera(self):
@@ -111,20 +143,66 @@ class Ec2Camera(CoordinatorEntity[Ec2Coordinator], Camera):
         return camera_device_info(self._data, self._camera_slug, self._camera)
 
     @property
-    def extra_state_attributes(self) -> dict[str, str]:
-        """Expose every quality's RTSP URL.
+    def extra_state_attributes(self) -> dict[str, str | None]:
+        """Expose every quality's RTSP URL, and how old the thumbnail is.
 
-        Handy for external players and for building an IPTV playlist without
-        having to know how stream names are composed.
+        The URLs are handy for external players and for building an IPTV
+        playlist without having to know how stream names are composed.
         """
         host = self._data.lan_host
         manager = self._data.go2rtc
-        return {
+        attributes: dict[str, str | None] = {
             f"rtsp_{QUALITY_LABELS[suffix].split()[0].lower()}": manager.rtsp_url(
                 f"{self._camera_slug}{suffix}", host
             )
             for suffix in STREAM_QUALITIES
         }
+        attributes["snapshot_at"] = (
+            self._last_image_at.isoformat() if self._last_image_at else None
+        )
+        return attributes
+
+    # -- lifecycle ------------------------------------------------------------
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        await self.hass.async_add_executor_job(self._load_snapshot)
+
+        @callback
+        def _dialled(mac: str) -> None:
+            # Somebody is opening this camera for real; grab a frame for the
+            # thumbnail while it is running anyway.
+            if mac.lower() != self._camera_slug:
+                return
+            if self._capture_task is None or self._capture_task.done():
+                self._capture_task = self.hass.async_create_task(
+                    self._async_capture_while_live()
+                )
+
+        self.async_on_remove(async_dispatcher_connect(self.hass, SIGNAL_DIAL, _dialled))
+
+    async def async_will_remove_from_hass(self) -> None:
+        if self._capture_task is not None:
+            self._capture_task.cancel()
+        await super().async_will_remove_from_hass()
+
+    def _load_snapshot(self) -> None:
+        try:
+            self._last_image = self._snapshot_path.read_bytes()
+            self._last_image_at = dt_util.utc_from_timestamp(
+                self._snapshot_path.stat().st_mtime
+            )
+        except OSError:
+            self._last_image = None
+            self._last_image_at = None
+
+    def _store_snapshot(self, payload: bytes) -> None:
+        self._snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self._snapshot_path.with_suffix(".tmp")
+        tmp.write_bytes(payload)
+        tmp.replace(self._snapshot_path)
+
+    # -- video ----------------------------------------------------------------
 
     async def stream_source(self) -> str | None:
         """Hand Home Assistant the RTSP URL; `stream` does the rest.
@@ -138,32 +216,56 @@ class Ec2Camera(CoordinatorEntity[Ec2Coordinator], Camera):
     async def async_camera_image(
         self, width: int | None = None, height: int | None = None
     ) -> bytes | None:
-        """Return a still image WITHOUT waking the camera.
+        """Return the last frame of the last real viewing. Never wakes the camera.
 
-        Only serves a frame if a stream is already live (someone is watching, or
-        a motion event just pulled one). Otherwise it returns the last frame we
-        saw, or nothing at all. Never opens a connection of its own -- see the
-        module docstring.
+        If a viewer happens to have the stream open right now, the frame is
+        refreshed from it, which costs nothing extra. Otherwise it is whatever
+        was kept, however old.
         """
-        if not await self._async_stream_is_live():
-            return self._last_image
+        if await self._async_stream_is_live():
+            await self._async_grab_frame()
+        return self._last_image
 
-        url = (
-            f"http://127.0.0.1:{self._data.go2rtc.api_listen.rsplit(':', 1)[-1]}"
-            f"/api/frame.jpeg?src={self._stream.name}"
-        )
+    async def _async_capture_while_live(self) -> None:
+        """Wait for a freshly dialled stream to carry media, then keep a frame."""
+        started = time.monotonic()
+        for offset in SNAPSHOT_ATTEMPTS:
+            await asyncio.sleep(max(0.0, started + offset - time.monotonic()))
+            if not await self._async_stream_is_live():
+                continue
+            if await self._async_grab_frame():
+                return
+
+    async def _async_grab_frame(self) -> bool:
+        """Fetch one frame from a stream that is already running."""
+        port = self._data.go2rtc.api_listen.rsplit(":", 1)[-1]
+        url = f"http://127.0.0.1:{port}/api/frame.jpeg?src={self._stream.name}"
         session = async_get_clientsession(self.hass)
         try:
             timeout = aiohttp.ClientTimeout(total=SNAPSHOT_TIMEOUT)
             async with session.get(url, timeout=timeout) as response:
-                if response.status == 200:
-                    self._last_image = await response.read()
+                if response.status != 200:
+                    return False
+                payload = await response.read()
         except (aiohttp.ClientError, TimeoutError) as err:
             _LOGGER.debug("Snapshot for %s failed: %s", self._stream.name, err)
-        return self._last_image
+            return False
+        if not payload:
+            return False
+        self._last_image = payload
+        self._last_image_at = dt_util.utcnow()
+        await self.hass.async_add_executor_job(self._store_snapshot, payload)
+        self.async_write_ha_state()
+        return True
 
     async def _async_stream_is_live(self) -> bool:
-        """True when go2rtc already has a producer for this stream."""
+        """True only when the stream carries media for somebody else.
+
+        go2rtc keeps a producer listed after the stream was opened once, so the
+        producer's existence proves nothing; it has to carry media, and a
+        consumer other than us has to be attached -- or our frame request
+        would be the thing that starts the stream and wakes the camera.
+        """
         port = self._data.go2rtc.api_listen.rsplit(":", 1)[-1]
         url = f"http://127.0.0.1:{port}/api/streams?src={self._stream.name}"
         session = async_get_clientsession(self.hass)
@@ -175,4 +277,11 @@ class Ec2Camera(CoordinatorEntity[Ec2Coordinator], Camera):
                 payload = await response.json(content_type=None)
         except (aiohttp.ClientError, TimeoutError, ValueError):
             return False
-        return bool(payload.get("producers"))
+        if not isinstance(payload, dict):
+            return False
+        producers = payload.get("producers") or []
+        has_media = any(
+            isinstance(producer, dict) and producer.get("medias")
+            for producer in producers
+        )
+        return has_media and bool(payload.get("consumers"))
