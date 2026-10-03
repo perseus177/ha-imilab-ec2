@@ -54,6 +54,12 @@ SNAPSHOT_TIMEOUT = 10
 # offsets (seconds). The first ~16-20 s go on waking the camera and the P2P
 # handshake, so the early attempts usually find no media yet and do nothing.
 SNAPSHOT_ATTEMPTS = (8, 20, 35, 60)
+# How old the kept frame must be before a running stream is asked for a new
+# one. go2rtc makes a JPEG from H.264 by running ffmpeg for it, and a dashboard
+# asks for thumbnails every ~10 s for as long as it is open; doing that while
+# Kodi plays would load a small box like the ODROID-C2 for nothing. Once per
+# five minutes is plenty for a thumbnail.
+SNAPSHOT_REFRESH = 300
 
 
 def camera_device_info(
@@ -129,6 +135,7 @@ class Ec2Camera(CoordinatorEntity[Ec2Coordinator], Camera):
         self._last_image: bytes | None = None
         self._last_image_at: datetime | None = None
         self._capture_task: asyncio.Task | None = None
+        self._grab_lock = asyncio.Lock()
 
     @property
     def _camera(self):
@@ -172,7 +179,7 @@ class Ec2Camera(CoordinatorEntity[Ec2Coordinator], Camera):
         def _dialled(mac: str) -> None:
             # Somebody is opening this camera for real; grab a frame for the
             # thumbnail while it is running anyway.
-            if mac.lower() != self._camera_slug:
+            if mac.lower() != self._camera_slug or self._snapshot_is_fresh():
                 return
             if self._capture_task is None or self._capture_task.done():
                 self._capture_task = self.hass.async_create_task(
@@ -222,41 +229,59 @@ class Ec2Camera(CoordinatorEntity[Ec2Coordinator], Camera):
         refreshed from it, which costs nothing extra. Otherwise it is whatever
         was kept, however old.
         """
-        if await self._async_stream_is_live():
+        if not self._snapshot_is_fresh() and await self._async_stream_is_live():
             await self._async_grab_frame()
         return self._last_image
+
+    def _snapshot_is_fresh(self) -> bool:
+        """True while the kept frame is recent enough not to bother the stream."""
+        if self._last_image is None or self._last_image_at is None:
+            return False
+        age = (dt_util.utcnow() - self._last_image_at).total_seconds()
+        return age < SNAPSHOT_REFRESH
 
     async def _async_capture_while_live(self) -> None:
         """Wait for a freshly dialled stream to carry media, then keep a frame."""
         started = time.monotonic()
         for offset in SNAPSHOT_ATTEMPTS:
             await asyncio.sleep(max(0.0, started + offset - time.monotonic()))
+            if self._snapshot_is_fresh():
+                return
             if not await self._async_stream_is_live():
                 continue
             if await self._async_grab_frame():
                 return
 
     async def _async_grab_frame(self) -> bool:
-        """Fetch one frame from a stream that is already running."""
-        port = self._data.go2rtc.api_listen.rsplit(":", 1)[-1]
-        url = f"http://127.0.0.1:{port}/api/frame.jpeg?src={self._stream.name}"
-        session = async_get_clientsession(self.hass)
-        try:
-            timeout = aiohttp.ClientTimeout(total=SNAPSHOT_TIMEOUT)
-            async with session.get(url, timeout=timeout) as response:
-                if response.status != 200:
-                    return False
-                payload = await response.read()
-        except (aiohttp.ClientError, TimeoutError) as err:
-            _LOGGER.debug("Snapshot for %s failed: %s", self._stream.name, err)
+        """Fetch one frame from a stream that is already running.
+
+        One at a time: each request has go2rtc run ffmpeg, and several
+        thumbnail requests arriving together must not multiply that.
+        """
+        if self._grab_lock.locked():
             return False
-        if not payload:
-            return False
-        self._last_image = payload
-        self._last_image_at = dt_util.utcnow()
-        await self.hass.async_add_executor_job(self._store_snapshot, payload)
-        self.async_write_ha_state()
-        return True
+        async with self._grab_lock:
+            if self._snapshot_is_fresh():
+                return True
+            port = self._data.go2rtc.api_listen.rsplit(":", 1)[-1]
+            url = f"http://127.0.0.1:{port}/api/frame.jpeg?src={self._stream.name}"
+            session = async_get_clientsession(self.hass)
+            try:
+                timeout = aiohttp.ClientTimeout(total=SNAPSHOT_TIMEOUT)
+                async with session.get(url, timeout=timeout) as response:
+                    if response.status != 200:
+                        return False
+                    payload = await response.read()
+            except (aiohttp.ClientError, TimeoutError) as err:
+                _LOGGER.debug("Snapshot for %s failed: %s", self._stream.name, err)
+                return False
+            if not payload:
+                return False
+            self._last_image = payload
+            self._last_image_at = dt_util.utcnow()
+            await self.hass.async_add_executor_job(self._store_snapshot, payload)
+            self.async_write_ha_state()
+            return True
 
     async def _async_stream_is_live(self) -> bool:
         """True only when the stream carries media for somebody else.
