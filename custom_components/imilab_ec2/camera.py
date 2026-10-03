@@ -67,6 +67,12 @@ WAKE_TIMEOUT = 35
 # see which stream providers fit. That is not a viewer, and must not wake
 # a battery camera; calls this soon after adding are left alone.
 WAKE_GRACE = 60
+# After waking the camera, the stream is held open for the viewer, at most
+# this long. go2rtc drops a producer the moment its last consumer leaves,
+# and redialling an awake camera still takes 5-8 s -- more than the 5 s a
+# client allows -- so somebody has to stay on the line until the viewer
+# arrives.
+HOLD_MAX = 45
 
 
 def camera_device_info(
@@ -144,6 +150,7 @@ class Ec2Camera(CoordinatorEntity[Ec2Coordinator], Camera):
         self._capture_task: asyncio.Task | None = None
         self._grab_lock = asyncio.Lock()
         self._added_at = 0.0
+        self._hold_task: asyncio.Task | None = None
 
     @property
     def _camera(self):
@@ -200,6 +207,8 @@ class Ec2Camera(CoordinatorEntity[Ec2Coordinator], Camera):
     async def async_will_remove_from_hass(self) -> None:
         if self._capture_task is not None:
             self._capture_task.cancel()
+        if self._hold_task is not None:
+            self._hold_task.cancel()
         await super().async_will_remove_from_hass()
 
     def _load_snapshot(self) -> None:
@@ -239,43 +248,73 @@ class Ec2Camera(CoordinatorEntity[Ec2Coordinator], Camera):
         return url
 
     async def _async_wake(self) -> None:
-        """Start the stream in go2rtc and wait until it carries media.
+        """Start the stream in go2rtc, hold it, and wait until it carries media.
 
-        A probe request adds a consumer for its duration and returns as soon
-        as the producer has negotiated its media, which is the moment the
-        camera is up. The producer may stop again before Home Assistant
-        connects a second later; reconnecting to an awake camera takes a
-        couple of seconds, well inside the 5 s a client allows.
+        The holder is a consumer of our own (an MP4 request that reads and
+        discards; no transcoding), so the producer stays up between the
+        camera coming online and the viewer connecting. A plain probe was
+        tried first: it returns the moment the camera is up, the producer is
+        dropped with it, and the viewer's connection a second later had to
+        redial -- 5-8 s even for an awake camera, still over the limit.
         """
         has_media, _ = await self._async_stream_state()
         if has_media:
             return
+        if self._hold_task is None or self._hold_task.done():
+            self._hold_task = self.hass.async_create_task(self._async_hold())
+        started = time.monotonic()
+        while time.monotonic() - started < WAKE_TIMEOUT:
+            await asyncio.sleep(0.5)
+            has_media, _ = await self._async_stream_state()
+            if has_media:
+                _LOGGER.debug(
+                    "Camera %s awake in %.1f s",
+                    self._stream.name,
+                    time.monotonic() - started,
+                )
+                return
+            if self._hold_task.done():
+                break
+        _LOGGER.warning(
+            "Camera %s did not come up within %d s", self._stream.name, WAKE_TIMEOUT
+        )
+
+    async def _async_hold(self) -> None:
+        """Keep the stream open until a real viewer has joined, or HOLD_MAX."""
         port = self._data.go2rtc.api_listen.rsplit(":", 1)[-1]
         url = (
-            f"http://127.0.0.1:{port}/api/streams"
-            f"?src={self._stream.name}&video=all&audio=all"
+            f"http://127.0.0.1:{port}/api/stream.mp4?src={self._stream.name}&video=h264"
         )
         session = async_get_clientsession(self.hass)
         started = time.monotonic()
+        checked = started
         try:
-            timeout = aiohttp.ClientTimeout(total=WAKE_TIMEOUT)
+            timeout = aiohttp.ClientTimeout(total=None, sock_read=WAKE_TIMEOUT)
             async with session.get(url, timeout=timeout) as response:
-                await response.read()
-                ok = response.status == 200
+                if response.status != 200:
+                    _LOGGER.debug(
+                        "Holding %s refused: HTTP %s",
+                        self._stream.name,
+                        response.status,
+                    )
+                    return
+                async for _chunk in response.content.iter_chunked(65536):
+                    now = time.monotonic()
+                    if now - started > HOLD_MAX:
+                        break
+                    if now - checked > 2:
+                        checked = now
+                        _, consumers = await self._async_stream_state()
+                        # Ourselves plus at least one more: hand over.
+                        if consumers > 1:
+                            _LOGGER.debug(
+                                "Viewer joined %s after %.1f s, letting go",
+                                self._stream.name,
+                                now - started,
+                            )
+                            break
         except (aiohttp.ClientError, TimeoutError) as err:
-            _LOGGER.warning(
-                "Camera %s did not come up within %d s: %s",
-                self._stream.name,
-                WAKE_TIMEOUT,
-                err,
-            )
-            return
-        _LOGGER.debug(
-            "Camera %s %s in %.1f s",
-            self._stream.name,
-            "awake" if ok else "did not start",
-            time.monotonic() - started,
-        )
+            _LOGGER.debug("Holding %s ended: %s", self._stream.name, err)
 
     async def async_camera_image(
         self, width: int | None = None, height: int | None = None
@@ -348,11 +387,11 @@ class Ec2Camera(CoordinatorEntity[Ec2Coordinator], Camera):
         consumer other than us has to be attached -- or our frame request
         would be the thing that starts the stream and wakes the camera.
         """
-        has_media, has_consumers = await self._async_stream_state()
-        return has_media and has_consumers
+        has_media, consumers = await self._async_stream_state()
+        return has_media and consumers > 0
 
-    async def _async_stream_state(self) -> tuple[bool, bool]:
-        """(producer carries media, somebody is consuming) for our stream."""
+    async def _async_stream_state(self) -> tuple[bool, int]:
+        """(producer carries media, number of consumers) for our stream."""
         port = self._data.go2rtc.api_listen.rsplit(":", 1)[-1]
         url = f"http://127.0.0.1:{port}/api/streams?src={self._stream.name}"
         session = async_get_clientsession(self.hass)
@@ -360,15 +399,15 @@ class Ec2Camera(CoordinatorEntity[Ec2Coordinator], Camera):
             timeout = aiohttp.ClientTimeout(total=5)
             async with session.get(url, timeout=timeout) as response:
                 if response.status != 200:
-                    return False, False
+                    return False, 0
                 payload = await response.json(content_type=None)
         except (aiohttp.ClientError, TimeoutError, ValueError):
-            return False, False
+            return False, 0
         if not isinstance(payload, dict):
-            return False, False
+            return False, 0
         producers = payload.get("producers") or []
         has_media = any(
             isinstance(producer, dict) and producer.get("medias")
             for producer in producers
         )
-        return has_media, bool(payload.get("consumers"))
+        return has_media, len(payload.get("consumers") or [])
