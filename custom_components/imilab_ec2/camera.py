@@ -149,7 +149,9 @@ class Ec2Camera(CoordinatorEntity[Ec2Coordinator], Camera):
         self._last_image_at: datetime | None = None
         self._capture_task: asyncio.Task | None = None
         self._grab_lock = asyncio.Lock()
-        self._added_at = 0.0
+        # From construction, not from async_added_to_hass: Home Assistant asks
+        # for stream_source() while adding the entity, before that runs.
+        self._added_at = time.monotonic()
         self._hold_task: asyncio.Task | None = None
 
     @property
@@ -189,7 +191,6 @@ class Ec2Camera(CoordinatorEntity[Ec2Coordinator], Camera):
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
         await self.hass.async_add_executor_job(self._load_snapshot)
-        self._added_at = time.monotonic()
 
         @callback
         def _dialled(mac: str) -> None:
@@ -274,7 +275,12 @@ class Ec2Camera(CoordinatorEntity[Ec2Coordinator], Camera):
                 )
                 return
             if self._hold_task.done():
-                break
+                # The holder could not even open the stream -- typically go2rtc
+                # is restarting right now; the viewer's own attempt will dial.
+                _LOGGER.debug(
+                    "Camera %s: stream could not be started yet", self._stream.name
+                )
+                return
         _LOGGER.warning(
             "Camera %s did not come up within %d s", self._stream.name, WAKE_TIMEOUT
         )
