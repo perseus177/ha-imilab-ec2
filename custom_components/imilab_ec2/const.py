@@ -35,13 +35,16 @@ CONF_WRITE_M3U: Final = "write_m3u"
 
 # RTSP MUST stay reachable from the LAN: external players (Kodi via IPTV Simple)
 # pull the streams straight off this port. Binding it to localhost silently
-# breaks them, so ":8554" -- not "127.0.0.1:8554" -- is the default.
-DEFAULT_RTSP_LISTEN: Final = ":8554"
-DEFAULT_API_LISTEN: Final = ":1984"
-DEFAULT_WEBRTC_LISTEN: Final = ":8555"
-
-# Home Assistant bundles its own unpatched go2rtc on 127.0.0.1:18554, so these
-# defaults do not collide with it.
+# breaks them, so ":8556" -- not "127.0.0.1:8556" -- is the default.
+#
+# The ports are deliberately NOT go2rtc's own 1984/8554/8555. Those are taken
+# by the go2rtc add-on, Frigate and the WebRTC Camera integration, and a
+# second go2rtc that cannot bind them serves nothing at all -- seen on a real
+# setup running the go2rtc add-on next to this. Nor are they 11984/18554, which
+# Home Assistant's own bundled go2rtc uses.
+DEFAULT_RTSP_LISTEN: Final = ":8556"
+DEFAULT_API_LISTEN: Final = ":1985"
+DEFAULT_WEBRTC_LISTEN: Final = ":8557"
 
 # --- polling -----------------------------------------------------------------
 

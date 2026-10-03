@@ -37,8 +37,10 @@ from typing import Any
 import voluptuous as vol
 from homeassistant.config_entries import (
     SOURCE_REAUTH,
+    ConfigEntry,
     ConfigFlow,
     ConfigFlowResult,
+    OptionsFlow,
 )
 from homeassistant.core import callback
 from homeassistant.helpers import config_validation as cv
@@ -52,14 +54,20 @@ from homeassistant.helpers.selector import (
 )
 
 from .const import (
+    CONF_API_LISTEN,
     CONF_CAMERAS,
     CONF_GATEWAY_DID,
     CONF_GATEWAY_HOST,
     CONF_GATEWAY_TOKEN,
     CONF_PASS_TOKEN,
     CONF_PASSWORD,
+    CONF_RTSP_LISTEN,
     CONF_USER_ID,
     CONF_USERNAME,
+    CONF_WEBRTC_LISTEN,
+    DEFAULT_API_LISTEN,
+    DEFAULT_RTSP_LISTEN,
+    DEFAULT_WEBRTC_LISTEN,
     DOMAIN,
 )
 from .discovery import discover
@@ -173,6 +181,11 @@ class Ec2ConfigFlow(ConfigFlow, domain=DOMAIN):
     """Sign in, discover gateways, add one."""
 
     VERSION = 1
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(config_entry: ConfigEntry) -> Ec2OptionsFlow:
+        return Ec2OptionsFlow()
 
     def __init__(self) -> None:
         self._cloud: XiaomiCloud | None = None
@@ -692,3 +705,54 @@ class Ec2ConfigFlow(ConfigFlow, domain=DOMAIN):
         )
 
     _last_error: str = "invalid_auth"
+
+
+def _port_of(listen: str) -> int | None:
+    """The port in a `[host]:port` listen address, or None if it is not one."""
+    host, sep, port = listen.strip().rpartition(":")
+    if not sep or not port.isdigit() or " " in host:
+        return None
+    number = int(port)
+    return number if 0 < number < 65536 else None
+
+
+class Ec2OptionsFlow(OptionsFlow):
+    """Ports for the bundled go2rtc.
+
+    Needed whenever another go2rtc already runs on the host -- the go2rtc
+    add-on, Frigate, WebRTC Camera -- because two cannot share a port, and the
+    one that loses serves nothing.
+    """
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        errors: dict[str, str] = {}
+        current = {
+            CONF_RTSP_LISTEN: DEFAULT_RTSP_LISTEN,
+            CONF_API_LISTEN: DEFAULT_API_LISTEN,
+            CONF_WEBRTC_LISTEN: DEFAULT_WEBRTC_LISTEN,
+            **self.config_entry.options,
+        }
+        if user_input is not None:
+            ports = [_port_of(user_input[key]) for key in current]
+            if None in ports:
+                errors["base"] = "invalid_listen"
+            elif len(set(ports)) != len(ports):
+                errors["base"] = "duplicate_port"
+            else:
+                return self.async_create_entry(
+                    data={key: user_input[key].strip() for key in current}
+                )
+            current.update(user_input)
+
+        return self.async_show_form(
+            step_id="init",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(key, default=current[key]): cv.string
+                    for key in (CONF_RTSP_LISTEN, CONF_API_LISTEN, CONF_WEBRTC_LISTEN)
+                }
+            ),
+            errors=errors,
+        )

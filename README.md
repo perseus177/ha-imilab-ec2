@@ -91,14 +91,18 @@ not the `subtype` number, which is not monotonic:
 | `<mac>_fluent` | 2 | 1080p, measurably the worst |
 | `<mac>_low` | 1 | Speed 720p |
 
-RTSP defaults to `:8554` **on every interface, on purpose**. External players —
+RTSP defaults to `:8556` **on every interface, on purpose**. External players —
 Kodi via IPTV Simple, for example — pull these streams directly. Binding RTSP to
 `127.0.0.1` silently breaks them.
 
 Stream names are a contract. Renaming one breaks any playlist pointing at it.
 
-Home Assistant bundles its own unpatched go2rtc on `127.0.0.1:18554`; the
-defaults here do not collide with it.
+The bundled go2rtc deliberately avoids go2rtc's usual ports: API `:1985`,
+RTSP `:8556`, WebRTC `:8557`. The usual 1984/8554/8555 are typically held by
+the go2rtc add-on, Frigate or WebRTC Camera, and a go2rtc that cannot bind its
+ports serves nothing. Home Assistant's own bundled go2rtc (`127.0.0.1:11984`,
+`:18554`) does not collide either. All three ports can be changed under
+**Configure** on the integration entry.
 
 ## Things that are the hardware, not bugs
 

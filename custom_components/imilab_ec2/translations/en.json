@@ -113,13 +113,17 @@
     "step": {
       "init": {
         "title": "Streaming ports",
-        "description": "RTSP must stay reachable from your network if external players (for example Kodi via IPTV Simple) pull these streams. Binding it to 127.0.0.1 will silently break them.",
+        "description": "Ports for the bundled go2rtc. They must not be taken by another go2rtc on this host - the go2rtc add-on, Frigate or WebRTC Camera usually hold 1984, 8554 and 8555 - or this one serves nothing.\n\nRTSP must stay reachable from your network if external players (for example Kodi via IPTV Simple) pull these streams, so use `:port`, not `127.0.0.1:port`.",
         "data": {
           "rtsp_listen": "RTSP listen address",
           "api_listen": "API listen address",
           "webrtc_listen": "WebRTC listen address"
         }
       }
+    },
+    "error": {
+      "invalid_listen": "Use the form :port or address:port, for example :8556.",
+      "duplicate_port": "Each of the three needs its own port."
     }
   }
 }

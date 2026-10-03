@@ -10,6 +10,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.event import async_track_time_interval
 
 from .auth import TokenRenewer
@@ -27,6 +28,7 @@ from .const import (
     DEFAULT_RTSP_LISTEN,
     DEFAULT_WEBRTC_LISTEN,
     DOMAIN,
+    GATEWAY_MODEL,
     TOKEN_CHECK_INTERVAL,
 )
 from .coordinator import Ec2Coordinator, Ec2RuntimeData, static_camera
@@ -65,10 +67,21 @@ async def async_setup_entry(hass: HomeAssistant, entry: Ec2ConfigEntry) -> bool:
     manager.rtsp_listen = entry.options.get(CONF_RTSP_LISTEN, DEFAULT_RTSP_LISTEN)
     manager.webrtc_listen = entry.options.get(CONF_WEBRTC_LISTEN, DEFAULT_WEBRTC_LISTEN)
 
+    gateway_id = f"gateway_{entry.data[CONF_GATEWAY_DID]}"
+    # The cameras hang off the gateway (`via_device`), so the gateway has to
+    # exist first; Home Assistant refuses a link to a device it does not know.
+    dr.async_get(hass).async_get_or_create(
+        config_entry_id=entry.entry_id,
+        identifiers={(DOMAIN, gateway_id)},
+        name=entry.title,
+        manufacturer="IMILAB / Xiaomi",
+        model=GATEWAY_MODEL,
+    )
+
     entry.runtime_data = Ec2RuntimeData(
         coordinator=coordinator,
         go2rtc=manager,
-        gateway_id=f"gateway_{entry.data[CONF_GATEWAY_DID]}",
+        gateway_id=gateway_id,
         lan_host=host_ip_for_players(hass, host),
     )
 
