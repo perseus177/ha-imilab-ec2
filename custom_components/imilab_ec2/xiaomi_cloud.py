@@ -694,6 +694,33 @@ class XiaomiCloud:
         decoded = _decrypt_rc4(self._signed_nonce(fields["_nonce"]), text)
         return json.loads(decoded)
 
+    async def async_device_rpc(
+        self, country: str, did: str, method: str, params: list[Any] | None = None
+    ) -> Any:
+        """Run a miio method on a device, relayed by the cloud.
+
+        The gateway keeps its own connection to Xiaomi, and the cloud passes
+        the call down it -- the same path the Mi Home app uses away from home.
+        So this needs the account, not the device's local miio token, which is
+        exactly what helps when the gateway rejects that token on the LAN.
+        Nothing reaches the camera: the gateway answers from its own state.
+        """
+        url = api_host(country) + f"/home/rpc/{did}"
+        payload = {
+            "id": int(time.time()) % 100000,
+            "method": method,
+            "params": params or [],
+        }
+        reply = await self._async_api(url, {"data": json.dumps(payload)})
+        if not isinstance(reply, dict):
+            raise XiaomiCloudError(f"{method} via cloud: unexpected reply")
+        code = reply.get("code")
+        if code not in (0, None):
+            raise XiaomiCloudError(
+                f"{method} via cloud: code {code}: {reply.get('message', '')}"
+            )
+        return reply.get("result")
+
     # -- discovery -----------------------------------------------------------
 
     async def _async_homes(self, country: str) -> list[tuple[int, str]]:

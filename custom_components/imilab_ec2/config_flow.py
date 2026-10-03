@@ -71,7 +71,7 @@ from .const import (
     DOMAIN,
 )
 from .discovery import discover
-from .miio import MiioError, MiioGateway
+from .miio import CameraInfo, MiioError, MiioGateway
 from .xiaomi_cloud import (
     CaptchaRequired,
     CloudDevice,
@@ -640,6 +640,11 @@ class Ec2ConfigFlow(ConfigFlow, domain=DOMAIN):
             else:
                 cameras = [{"mac": cam.mac, "name": cam.name} for cam in found]
 
+        if not cameras:
+            # The gateway will not tell us locally; ask through the cloud,
+            # which needs only the account we are already signed in with.
+            cameras = await self._async_cameras_via_cloud(gateway)
+
         data = {
             CONF_GATEWAY_HOST: host,
             CONF_GATEWAY_DID: gateway.did,
@@ -665,6 +670,36 @@ class Ec2ConfigFlow(ConfigFlow, domain=DOMAIN):
             self._pending_data = data
             return await self.async_step_cameras()
         return self.async_create_entry(title=title, data=data)
+
+    async def _async_cameras_via_cloud(
+        self, gateway: CloudDevice
+    ) -> list[dict[str, str]]:
+        """`get_camera_list` relayed by the Xiaomi cloud; [] if that fails too."""
+        assert self._cloud is not None
+        try:
+            result = await self._cloud.async_device_rpc(
+                gateway.country or self._country, gateway.did, "get_camera_list"
+            )
+        except XiaomiCloudError as err:
+            _LOGGER.warning(
+                "The cloud could not list the cameras of gateway %s either: %s",
+                gateway.did,
+                err,
+            )
+            return []
+        found = [
+            CameraInfo.from_dict(item)
+            for item in (result if isinstance(result, list) else [])
+            if isinstance(item, dict) and item.get("mac")
+        ]
+        _LOGGER.warning(
+            "Gateway %s listed %d camera(s) through the cloud: %s (raw reply: %s)",
+            gateway.did,
+            len(found),
+            ", ".join(camera.mac for camera in found) or "none",
+            str(result)[:500],
+        )
+        return [{"mac": camera.mac, "name": camera.name} for camera in found]
 
     async def async_step_cameras(
         self, user_input: dict[str, Any] | None = None
