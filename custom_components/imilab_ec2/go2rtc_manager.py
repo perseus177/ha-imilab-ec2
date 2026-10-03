@@ -52,7 +52,7 @@ _LOGGER = logging.getLogger(__name__)
 
 # Our own release, not AlexxIT's. Pinned on purpose.
 RELEASE_REPO = "perseus177/ha-imilab-ec2"
-BINARY_VERSION = "1.9.14-ec2.2"
+BINARY_VERSION = "1.9.14-ec2.3"
 DOWNLOAD_TIMEOUT = 300
 # go2rtc output kept in memory for the diagnostics download and for the
 # post-mortem logged when the process dies.
