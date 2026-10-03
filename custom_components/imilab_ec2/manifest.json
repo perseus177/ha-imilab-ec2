@@ -10,5 +10,5 @@
   "iot_class": "local_polling",
   "issue_tracker": "https://github.com/perseus177/ha-imilab-ec2/issues",
   "requirements": [],
-  "version": "0.7.4"
+  "version": "0.7.5"
 }

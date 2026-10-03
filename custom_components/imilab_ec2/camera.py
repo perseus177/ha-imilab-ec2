@@ -60,6 +60,13 @@ SNAPSHOT_ATTEMPTS = (8, 20, 35, 60)
 # Kodi plays would load a small box like the ODROID-C2 for nothing. Once per
 # five minutes is plenty for a thumbnail.
 SNAPSHOT_REFRESH = 300
+# How long stream_source() may hold Home Assistant while the camera wakes.
+# Cold start is 16-20 s; this leaves room for a slow cloud on top.
+WAKE_TIMEOUT = 35
+# Home Assistant calls stream_source() once when the entity is added, to
+# see which stream providers fit. That is not a viewer, and must not wake
+# a battery camera; calls this soon after adding are left alone.
+WAKE_GRACE = 60
 
 
 def camera_device_info(
@@ -136,6 +143,7 @@ class Ec2Camera(CoordinatorEntity[Ec2Coordinator], Camera):
         self._last_image_at: datetime | None = None
         self._capture_task: asyncio.Task | None = None
         self._grab_lock = asyncio.Lock()
+        self._added_at = 0.0
 
     @property
     def _camera(self):
@@ -174,6 +182,7 @@ class Ec2Camera(CoordinatorEntity[Ec2Coordinator], Camera):
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
         await self.hass.async_add_executor_job(self._load_snapshot)
+        self._added_at = time.monotonic()
 
         @callback
         def _dialled(mac: str) -> None:
@@ -212,13 +221,61 @@ class Ec2Camera(CoordinatorEntity[Ec2Coordinator], Camera):
     # -- video ----------------------------------------------------------------
 
     async def stream_source(self) -> str | None:
-        """Hand Home Assistant the RTSP URL; `stream` does the rest.
+        """Hand Home Assistant the RTSP URL, with the camera already awake.
 
-        Cold start is roughly 16-20 s -- waking the camera plus the P2P
-        handshake. That is the hardware, not a fault, so anything consuming this
-        needs a generous timeout.
+        Cold start is roughly 16-20 s: waking the camera plus the P2P
+        handshake. Home Assistant's own go2rtc, which carries WebRTC to the
+        browser, gives an RTSP server 5 s to answer DESCRIBE, and go2rtc can
+        only answer once the camera is up. So the first attempt always failed
+        and the browser showed a still image; the second worked because the
+        camera was awake by then. Home Assistant asks for this URL right
+        before it connects, so the camera is woken here, and the URL is handed
+        over once the stream carries media -- then DESCRIBE is answered at
+        once.
         """
-        return self._data.go2rtc.rtsp_url(self._stream.name, "127.0.0.1")
+        url = self._data.go2rtc.rtsp_url(self._stream.name, "127.0.0.1")
+        if self.hass.is_running and time.monotonic() - self._added_at > WAKE_GRACE:
+            await self._async_wake()
+        return url
+
+    async def _async_wake(self) -> None:
+        """Start the stream in go2rtc and wait until it carries media.
+
+        A probe request adds a consumer for its duration and returns as soon
+        as the producer has negotiated its media, which is the moment the
+        camera is up. The producer may stop again before Home Assistant
+        connects a second later; reconnecting to an awake camera takes a
+        couple of seconds, well inside the 5 s a client allows.
+        """
+        has_media, _ = await self._async_stream_state()
+        if has_media:
+            return
+        port = self._data.go2rtc.api_listen.rsplit(":", 1)[-1]
+        url = (
+            f"http://127.0.0.1:{port}/api/streams"
+            f"?src={self._stream.name}&video=all&audio=all"
+        )
+        session = async_get_clientsession(self.hass)
+        started = time.monotonic()
+        try:
+            timeout = aiohttp.ClientTimeout(total=WAKE_TIMEOUT)
+            async with session.get(url, timeout=timeout) as response:
+                await response.read()
+                ok = response.status == 200
+        except (aiohttp.ClientError, TimeoutError) as err:
+            _LOGGER.warning(
+                "Camera %s did not come up within %d s: %s",
+                self._stream.name,
+                WAKE_TIMEOUT,
+                err,
+            )
+            return
+        _LOGGER.debug(
+            "Camera %s %s in %.1f s",
+            self._stream.name,
+            "awake" if ok else "did not start",
+            time.monotonic() - started,
+        )
 
     async def async_camera_image(
         self, width: int | None = None, height: int | None = None
@@ -291,6 +348,11 @@ class Ec2Camera(CoordinatorEntity[Ec2Coordinator], Camera):
         consumer other than us has to be attached -- or our frame request
         would be the thing that starts the stream and wakes the camera.
         """
+        has_media, has_consumers = await self._async_stream_state()
+        return has_media and has_consumers
+
+    async def _async_stream_state(self) -> tuple[bool, bool]:
+        """(producer carries media, somebody is consuming) for our stream."""
         port = self._data.go2rtc.api_listen.rsplit(":", 1)[-1]
         url = f"http://127.0.0.1:{port}/api/streams?src={self._stream.name}"
         session = async_get_clientsession(self.hass)
@@ -298,15 +360,15 @@ class Ec2Camera(CoordinatorEntity[Ec2Coordinator], Camera):
             timeout = aiohttp.ClientTimeout(total=5)
             async with session.get(url, timeout=timeout) as response:
                 if response.status != 200:
-                    return False
+                    return False, False
                 payload = await response.json(content_type=None)
         except (aiohttp.ClientError, TimeoutError, ValueError):
-            return False
+            return False, False
         if not isinstance(payload, dict):
-            return False
+            return False, False
         producers = payload.get("producers") or []
         has_media = any(
             isinstance(producer, dict) and producer.get("medias")
             for producer in producers
         )
-        return has_media and bool(payload.get("consumers"))
+        return has_media, bool(payload.get("consumers"))
