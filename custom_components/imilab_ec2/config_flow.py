@@ -35,7 +35,11 @@ from collections.abc import Mapping
 from typing import Any
 
 import voluptuous as vol
-from homeassistant.config_entries import SOURCE_REAUTH, ConfigFlow, ConfigFlowResult
+from homeassistant.config_entries import (
+    SOURCE_REAUTH,
+    ConfigFlow,
+    ConfigFlowResult,
+)
 from homeassistant.core import callback
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.aiohttp_client import async_create_clientsession
@@ -43,6 +47,8 @@ from homeassistant.helpers.selector import (
     SelectSelector,
     SelectSelectorConfig,
     SelectSelectorMode,
+    TextSelector,
+    TextSelectorConfig,
 )
 
 from .const import (
@@ -76,6 +82,7 @@ CONF_GATEWAY = "gateway"
 CONF_COUNTRY = "country"
 CONF_CAPTCHA = "captcha"
 CONF_CODE = "code"
+CONF_MACS = "macs"
 
 # Where the account lives. The Xiaomi app calls mainland China the default, and
 # it is served from the bare host; every other region is a subdomain.
@@ -113,6 +120,46 @@ CAPTCHA_SCHEMA = vol.Schema({vol.Required(CONF_CAPTCHA): cv.string})
 
 CODE_SCHEMA = vol.Schema({vol.Required(CONF_CODE): cv.string})
 
+
+def _macs_schema(default: str = "") -> vol.Schema:
+    return vol.Schema(
+        {
+            vol.Required(CONF_MACS, default=default): TextSelector(
+                TextSelectorConfig(multiline=True)
+            )
+        }
+    )
+
+
+def parse_cameras(text: str) -> list[dict[str, str]] | None:
+    """Read camera MACs typed by hand; None if any of them is not a MAC.
+
+    Accepts `B8DE5E4D1C25` or `B8DE5E4D1C25=Balcony`, separated by commas or
+    newlines. Colons and dashes inside a MAC are ignored, so a MAC copied in
+    the usual `B8:DE:5E:4D:1C:25` form works too.
+    """
+    cameras: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in text.replace(",", "\n").splitlines():
+        item = item.strip()
+        if not item:
+            continue
+        mac, _, name = item.partition("=")
+        mac = mac.strip().replace(":", "").replace("-", "").upper()
+        if len(mac) != 12 or any(c not in "0123456789ABCDEF" for c in mac):
+            return None
+        if mac in seen:
+            continue
+        seen.add(mac)
+        cameras.append({"mac": mac, "name": name.strip() or f"EC2 camera {mac[-4:]}"})
+    return cameras or None
+
+
+def format_cameras(cameras: list[dict[str, str]]) -> str:
+    """The inverse of `parse_cameras`, to prefill the form."""
+    return "\n".join(f"{c['mac']}={c.get('name', '')}" for c in cameras)
+
+
 TOKEN_SCHEMA = vol.Schema(
     {
         vol.Required(CONF_USER_ID): cv.string,
@@ -139,6 +186,10 @@ class Ec2ConfigFlow(ConfigFlow, domain=DOMAIN):
         self._qr: QrLogin | None = None
         self._qr_task: asyncio.Task[None] | None = None
         self._qr_error: str | None = None
+        # An entry waiting only for its camera list, when the gateway would
+        # not tell us which cameras it serves.
+        self._pending_title: str = ""
+        self._pending_data: dict[str, Any] = {}
 
     # -- entry points ---------------------------------------------------------
 
@@ -571,8 +622,53 @@ class Ec2ConfigFlow(ConfigFlow, domain=DOMAIN):
             data[CONF_USERNAME] = self._username
             data[CONF_PASSWORD] = self._password
 
-        return self.async_create_entry(
-            title=gateway.name or f"EC2 gateway {host}", data=data
+        title = gateway.name or f"EC2 gateway {host}"
+        if not cameras:
+            # The gateway did not answer, so we cannot know which cameras it
+            # serves. Streaming does not need it to -- only their MACs -- so
+            # ask for those rather than creating an entry with no cameras,
+            # which could never set up.
+            self._pending_title = title
+            self._pending_data = data
+            return await self.async_step_cameras()
+        return self.async_create_entry(title=title, data=data)
+
+    async def async_step_cameras(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Take the camera MACs by hand."""
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            cameras = parse_cameras(user_input[CONF_MACS])
+            if cameras is None:
+                errors["base"] = "invalid_macs"
+            else:
+                return self.async_create_entry(
+                    title=self._pending_title,
+                    data={**self._pending_data, CONF_CAMERAS: cameras},
+                )
+        return self.async_show_form(
+            step_id="cameras", data_schema=_macs_schema(), errors=errors
+        )
+
+    async def async_step_reconfigure(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Change which cameras an existing gateway entry streams."""
+        entry = self._get_reconfigure_entry()
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            cameras = parse_cameras(user_input[CONF_MACS])
+            if cameras is None:
+                errors["base"] = "invalid_macs"
+            else:
+                return self.async_update_reload_and_abort(
+                    entry, data={**entry.data, CONF_CAMERAS: cameras}
+                )
+        return self.async_show_form(
+            step_id="reconfigure",
+            data_schema=_macs_schema(format_cameras(entry.data.get(CONF_CAMERAS, []))),
+            errors=errors,
         )
 
     _last_error: str = "invalid_auth"

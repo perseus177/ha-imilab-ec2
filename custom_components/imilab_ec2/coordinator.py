@@ -102,7 +102,12 @@ class Ec2Coordinator(DataUpdateCoordinator[dict[str, CameraInfo]]):
                     )
                     self._warned = True
                 return self._fallback
-            raise UpdateFailed(str(err)) from err
+            # Nothing to fall back to: without the gateway's list or MACs
+            # entered by hand there is no camera to stream.
+            raise UpdateFailed(
+                f"{err}. The gateway did not list its cameras and none are "
+                "configured; enter their MACs with Reconfigure"
+            ) from err
 
         self._warned = False
         return {camera.slug: camera for camera in cameras}

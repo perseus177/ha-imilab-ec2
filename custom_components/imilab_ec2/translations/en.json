@@ -67,6 +67,20 @@
         "data": {
           "code": "Verification code"
         }
+      },
+      "cameras": {
+        "title": "Which cameras?",
+        "description": "The gateway did not answer, so it cannot say which cameras it serves. Streaming does not need it to - only the camera MACs.\n\nEnter one per line or comma separated, optionally with a name: `B8DE5E4D1C25=Balcony`. The MAC is printed on the camera and shown in the Mi Home app under the camera's device info.",
+        "data": {
+          "macs": "Camera MACs"
+        }
+      },
+      "reconfigure": {
+        "title": "Cameras on this gateway",
+        "description": "One per line or comma separated, optionally with a name: `B8DE5E4D1C25=Balcony`. Stream names are derived from the MAC, so changing a name does not break playlists.",
+        "data": {
+          "macs": "Camera MACs"
+        }
       }
     },
     "error": {
@@ -78,7 +92,8 @@
       "invalid_code": "That code was not accepted.",
       "code_quota": "Xiaomi will not send another verification code right now - too many have been requested. Retrying keeps the limit alive. Go back and sign in with a QR code instead: it needs no code and is not affected.",
       "qr_expired": "The QR code expired before it was scanned. Submit again for a new one.",
-      "qr_failed": "Xiaomi did not complete the QR sign-in. Submit again for a new code."
+      "qr_failed": "Xiaomi did not complete the QR sign-in. Submit again for a new code.",
+      "invalid_macs": "That is not a list of MACs. Each one is 12 hexadecimal characters, for example B8DE5E4D1C25."
     },
     "abort": {
       "cannot_connect": "Could not reach the Xiaomi cloud to list your devices.",
@@ -87,7 +102,8 @@
       "no_address": "The gateway has no reachable address. It must be on the same network as Home Assistant.",
       "gateway_gone": "That gateway is no longer available.",
       "reauth_successful": "Signed in again successfully.",
-      "wrong_account": "That is a different Xiaomi account from the one these cameras were set up with. Sign in with the account that owns them."
+      "wrong_account": "That is a different Xiaomi account from the one these cameras were set up with. Sign in with the account that owns them.",
+      "reconfigure_successful": "Cameras updated."
     },
     "progress": {
       "qr_scan": "Open the **Mi Home** app signed in to the account that **owns** the cameras, tap **+** then **Scan**, and scan this code:\n\n![QR code]({qr_image})\n\nOr open [this link]({login_url}) and sign in on Xiaomi's own page.\n\nThe code is valid for about 5 minutes. This step continues on its own once you confirm."
