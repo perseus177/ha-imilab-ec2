@@ -34,6 +34,24 @@ the rest.
 2. Install **IMILAB / Mijia EC2 cameras**, then restart Home Assistant.
 3. **Settings → Devices & Services → Add Integration → IMILAB / Mijia EC2**.
 
+## Signing in
+
+Three ways in, offered in this order:
+
+1. **QR code (recommended).** The same login the Xiaomi Cloud Map Extractor
+   offers. Scan the code in the Mi Home app signed in to the account that
+   **owns** the cameras, or open the link and sign in on Xiaomi's own page.
+   Xiaomi then completes the sign-in for Home Assistant. No password, captcha
+   or verification code goes through the integration, so Xiaomi's daily limit
+   on verification codes cannot block it. The code is valid for about five
+   minutes.
+2. **Username and password.** Captchas and email/SMS codes are handled in the
+   dialog. Repeated attempts can run into Xiaomi's code limit (error 70022),
+   which lasts at least a day; use the QR code instead.
+3. **User ID and passToken.** For an existing setup that already has one.
+
+The same three are offered when Xiaomi stops accepting the stored token.
+
 ## Configuration
 
 | Field | Required | What it is |

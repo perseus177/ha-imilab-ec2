@@ -11,8 +11,15 @@ knows the model; the scan knows the current address. Using both, and matching
 them on device id, beats either alone -- and streaming needs the account
 regardless, because every connection fetches fresh P2P keys from the cloud.
 
-Challenges -- a captcha, a verification code, or both, in any order and more
-than once -- are handled here rather than by sending the user to a web page.
+The first choice is a QR code, as in the Xiaomi Cloud Map Extractor: the owner
+scans it in the Mi Home app (or opens the link and signs in on Xiaomi's page),
+and Xiaomi completes the login for this flow by answering a long poll. No
+password, captcha or verification code passes through here, so Xiaomi's daily
+code quota cannot block it.
+
+For the password route, challenges -- a captcha, a verification code, or both,
+in any order and more than once -- are handled here rather than by sending the
+user to a web page.
 Verification is started from this client, Xiaomi sends the code, and the code
 is submitted from this client too, which is the approach go2rtc takes and the
 reason the same account signs in there on the first attempt. Sending the user
@@ -22,12 +29,14 @@ exactly where it was, which loops forever.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Mapping
 from typing import Any
 
 import voluptuous as vol
-from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
+from homeassistant.config_entries import SOURCE_REAUTH, ConfigFlow, ConfigFlowResult
+from homeassistant.core import callback
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.aiohttp_client import async_create_clientsession
 from homeassistant.helpers.selector import (
@@ -53,6 +62,8 @@ from .xiaomi_cloud import (
     CaptchaRequired,
     CloudDevice,
     CodeQuotaExhausted,
+    QrExpired,
+    QrLogin,
     VerificationRequired,
     XiaomiCloud,
     XiaomiCloudError,
@@ -94,6 +105,10 @@ CREDENTIALS_SCHEMA = vol.Schema(
     }
 )
 
+REGION_SCHEMA = vol.Schema(
+    {vol.Required(CONF_COUNTRY, default="cn"): _country_selector()}
+)
+
 CAPTCHA_SCHEMA = vol.Schema({vol.Required(CONF_CAPTCHA): cv.string})
 
 CODE_SCHEMA = vol.Schema({vol.Required(CONF_CODE): cv.string})
@@ -121,6 +136,9 @@ class Ec2ConfigFlow(ConfigFlow, domain=DOMAIN):
         self._country: str = "cn"
         self._gateways: list[CloudDevice] = []
         self._lan: dict[int, str] = {}
+        self._qr: QrLogin | None = None
+        self._qr_task: asyncio.Task[None] | None = None
+        self._qr_error: str | None = None
 
     # -- entry points ---------------------------------------------------------
 
@@ -129,8 +147,83 @@ class Ec2ConfigFlow(ConfigFlow, domain=DOMAIN):
     ) -> ConfigFlowResult:
         """Choose how to sign in."""
         return self.async_show_menu(
-            step_id="user", menu_options=["credentials", "token"]
+            step_id="user", menu_options=["qr", "credentials", "token"]
         )
+
+    async def async_step_qr(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Pick the region, then show the QR code.
+
+        The region is asked for first because the QR login itself does not
+        reveal it, and asking the wrong one finds no devices.
+        """
+        errors: dict[str, str] = {}
+        if self._qr_error:
+            errors["base"], self._qr_error = self._qr_error, None
+        elif user_input is None and self.source == SOURCE_REAUTH:
+            # Signing in again lists no devices, so the region does not matter.
+            user_input = {}
+
+        if user_input is not None:
+            self._country = user_input.get(CONF_COUNTRY, "cn")
+            cloud = self._async_cloud()
+            try:
+                self._qr = await cloud.async_qr_start()
+            except XiaomiCloudError as err:
+                _LOGGER.debug("Could not get a login QR code: %s", err)
+                errors["base"] = "cannot_connect"
+            else:
+                self._qr_task = None
+                return await self.async_step_qr_scan()
+
+        return self.async_show_form(
+            step_id="qr", data_schema=REGION_SCHEMA, errors=errors
+        )
+
+    async def async_step_qr_scan(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Show the code and wait for Xiaomi to confirm it was scanned."""
+        assert self._qr is not None
+        if self._qr_task is None:
+            self._qr_task = self.hass.async_create_task(
+                self._async_cloud().async_qr_wait()
+            )
+
+        if not self._qr_task.done():
+            return self.async_show_progress(
+                step_id="qr_scan",
+                progress_action="qr_scan",
+                description_placeholders={
+                    "qr_image": self._qr.image_data_uri,
+                    "login_url": self._qr.login_url,
+                },
+                progress_task=self._qr_task,
+            )
+
+        err = self._qr_task.exception()
+        self._qr_task = None
+        if err is None:
+            return self.async_show_progress_done(next_step_id="qr_done")
+        if isinstance(err, QrExpired):
+            self._qr_error = "qr_expired"
+        else:
+            _LOGGER.debug("QR sign-in failed: %s", err)
+            self._qr_error = "qr_failed"
+        return self.async_show_progress_done(next_step_id="qr")
+
+    @callback
+    def async_remove(self) -> None:
+        """Stop waiting for a scan when the dialog is closed."""
+        if self._qr_task is not None and not self._qr_task.done():
+            self._qr_task.cancel()
+
+    async def async_step_qr_done(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Signed in by QR code."""
+        return await self._async_after_login()
 
     async def async_step_credentials(
         self, user_input: dict[str, Any] | None = None
@@ -256,42 +349,37 @@ class Ec2ConfigFlow(ConfigFlow, domain=DOMAIN):
     async def async_step_reauth_confirm(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Re-run the login and update the stored token in place."""
-        errors: dict[str, str] = {}
+        """Offer the same ways in as the first setup.
 
-        if user_input is not None:
-            self._username = user_input[CONF_USERNAME].strip()
-            self._password = user_input[CONF_PASSWORD]
-            cloud = self._async_cloud()
-            try:
-                await cloud.async_login(self._username, self._password)
-            except CaptchaRequired as err:
-                self._captcha_image = err.image_data_uri
-                return await self.async_step_captcha()
-            except VerificationRequired as err:
-                self._code_destination = err.destination
-                return await self.async_step_code()
-            except XiaomiCloudError as err:
-                _LOGGER.debug("Re-authentication failed: %s", err)
-                errors["base"] = "invalid_auth"
-            else:
-                entry = self._get_reauth_entry()
-                return self.async_update_reload_and_abort(
-                    entry,
-                    data={
-                        **entry.data,
-                        CONF_USER_ID: cloud.user_id,
-                        CONF_PASS_TOKEN: cloud.pass_token,
-                        # Store them this time, so the next rotation renews
-                        # itself instead of coming back here.
-                        CONF_USERNAME: self._username,
-                        CONF_PASSWORD: self._password,
-                    },
-                )
-
-        return self.async_show_form(
-            step_id="reauth_confirm", data_schema=CREDENTIALS_SCHEMA, errors=errors
+        Every route ends in `_async_after_login`, which updates this entry in
+        place instead of creating a new one. Before, only the password route
+        existed here, and a captcha or code on the way sent it into the setup
+        path, which could never finish a re-authentication.
+        """
+        return self.async_show_menu(
+            step_id="reauth_confirm", menu_options=["qr", "credentials", "token"]
         )
+
+    async def _async_finish_reauth(self) -> ConfigFlowResult:
+        """Store the new token on the entry being re-authenticated."""
+        assert self._cloud is not None
+        entry = self._get_reauth_entry()
+        stored_user = entry.data.get(CONF_USER_ID)
+        if stored_user and self._cloud.user_id and stored_user != self._cloud.user_id:
+            # A different account cannot stream these cameras; refuse rather
+            # than overwrite a working owner with a shared user.
+            return self.async_abort(reason="wrong_account")
+        data = {
+            **entry.data,
+            CONF_USER_ID: self._cloud.user_id or stored_user,
+            CONF_PASS_TOKEN: self._cloud.pass_token,
+        }
+        if self._username and self._password:
+            # Stored this time, so the next expiry renews itself instead of
+            # coming back here.
+            data[CONF_USERNAME] = self._username
+            data[CONF_PASSWORD] = self._password
+        return self.async_update_reload_and_abort(entry, data=data)
 
     # -- discovery ------------------------------------------------------------
 
@@ -408,6 +496,8 @@ class Ec2ConfigFlow(ConfigFlow, domain=DOMAIN):
     async def _async_after_login(self) -> ConfigFlowResult:
         """Ask the cloud for gateways, then confirm their addresses on the LAN."""
         assert self._cloud is not None
+        if self.source == SOURCE_REAUTH:
+            return await self._async_finish_reauth()
         try:
             self._gateways = await self._cloud.async_find_gateways(self._country)
         except XiaomiCloudError as err:

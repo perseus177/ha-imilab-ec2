@@ -31,6 +31,7 @@ what their local miio tokens are, instead of asking a human to type them in.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -41,6 +42,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import aiohttp
+from yarl import URL
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -50,6 +52,10 @@ JSON_GUARD = "&&&START&&&"
 SID = "xiaomiio"
 FORM_CT = "application/x-www-form-urlencoded"
 TIMEOUT = 20
+# One held-open long poll while waiting for the QR code to be scanned, and the
+# pause before retrying one that failed outright.
+QR_POLL_TIMEOUT = 60
+QR_POLL_PAUSE = 2
 
 # Servers to sweep when we do not know where the account lives. "cn" is the
 # bare host; every other one is a subdomain. The sweep stops as soon as a
@@ -110,6 +116,18 @@ class VerificationRequired(XiaomiCloudError):
     def destination(self) -> str:
         """Where the code went, as Xiaomi masks it."""
         return self.masked_email or self.masked_phone or "your registered contact"
+
+
+class QrExpired(XiaomiCloudError):
+    """Nobody scanned the QR code before Xiaomi let it lapse (~5 minutes)."""
+
+
+@dataclass(frozen=True)
+class QrLogin:
+    """A login QR code, and the same login as a link for a browser."""
+
+    image_data_uri: str
+    login_url: str
 
 
 @dataclass(frozen=True)
@@ -258,6 +276,8 @@ class XiaomiCloud:
         # captcha's ick cookie, and the verification flag and session. Mirrors
         # the auth map go2rtc keeps for exactly the same reason.
         self._auth: dict[str, str] = {}
+        self._long_polling_url: str | None = None
+        self._qr_deadline = 0.0
 
     # -- login ---------------------------------------------------------------
     #
@@ -432,6 +452,105 @@ class XiaomiCloud:
         raise VerificationRequired(
             info.get("maskedPhone") or "", info.get("maskedEmail") or ""
         )
+
+    # -- QR login --------------------------------------------------------------
+    #
+    # Ported from the Xiaomi Cloud Map Extractor (v3), which offers this next to
+    # the password sign-in. The owner scans a code in the Mi Home app -- or
+    # opens the link and signs in on Xiaomi's own page -- and Xiaomi completes
+    # the login for THIS client by answering a long poll. No password, captcha
+    # or verification code ever passes through here, so the daily code quota
+    # (70022) cannot get in the way, and the answer carries a passToken, which
+    # is exactly what go2rtc needs.
+
+    async def async_qr_start(self) -> QrLogin:
+        """Ask Xiaomi for a login QR code and remember where to wait for it."""
+        first = await self._async_raw(
+            "GET", f"{ACCOUNT_BASE}/pass/serviceLogin?_json=true&sid={SID}"
+        )
+        location = URL(first.get("location") or "")
+        params = {
+            "_qrsize": "480",
+            "qs": first.get("qs", ""),
+            "bizDeviceType": "",
+            "callback": first.get("callback", STS_CALLBACK),
+            "_json": "true",
+            "theme": "",
+            "sid": SID,
+            "needTheme": "false",
+            "showActiveX": "false",
+            "serviceParam": location.query.get("serviceParam", ""),
+            "_local": "en_GB",
+            "_sign": first.get("_sign", ""),
+            "_dc": str(int(time.time() * 1000)),
+        }
+        data = await self._async_raw(
+            "GET", str(URL(f"{ACCOUNT_BASE}/longPolling/loginUrl").with_query(params))
+        )
+        if data.get("code") != 0 or not data.get("qr") or not data.get("lp"):
+            raise XiaomiCloudError(f"no QR code: {_reason(data)}")
+
+        try:
+            async with self._session.get(
+                data["qr"],
+                headers={"User-Agent": self._agent},
+                timeout=aiohttp.ClientTimeout(total=TIMEOUT),
+            ) as response:
+                payload = await response.read()
+        except aiohttp.ClientError as err:
+            raise XiaomiCloudError(f"QR image: {err}") from err
+
+        self._long_polling_url = data["lp"]
+        self._qr_deadline = time.monotonic() + int(data.get("timeout") or 300)
+        encoded = base64.b64encode(payload).decode()
+        return QrLogin(
+            image_data_uri=f"data:{_image_mime(payload)};base64,{encoded}",
+            login_url=data.get("loginUrl", ""),
+        )
+
+    async def async_qr_wait(self) -> None:
+        """Wait until the code is scanned, then finish the sign-in.
+
+        The poll is held open by Xiaomi and answered the moment the owner
+        confirms in the app. A single request may time out before that, so it
+        is repeated until the code itself expires.
+        """
+        if not self._long_polling_url:
+            raise XiaomiCloudError("no QR login in progress")
+        data: dict[str, Any] | None = None
+        while data is None:
+            if time.monotonic() > self._qr_deadline:
+                raise QrExpired("the QR code expired before it was scanned")
+            try:
+                async with self._session.get(
+                    self._long_polling_url,
+                    headers={"User-Agent": self._agent, "Connection": "keep-alive"},
+                    timeout=aiohttp.ClientTimeout(total=QR_POLL_TIMEOUT),
+                ) as response:
+                    text = await response.text()
+                    status = response.status
+            except TimeoutError:
+                continue
+            except aiohttp.ClientError as err:
+                _LOGGER.debug("QR long poll failed, retrying: %s", err)
+                await asyncio.sleep(QR_POLL_PAUSE)
+                continue
+            if status != 200:
+                _LOGGER.debug("QR long poll answered HTTP %s, retrying", status)
+                await asyncio.sleep(QR_POLL_PAUSE)
+                continue
+            data = _to_json(text)
+
+        self._long_polling_url = None
+        if data.get("code") != 0 or not data.get("location"):
+            raise XiaomiCloudError(f"QR sign-in refused: {_reason(data)}")
+        self.user_id = str(data.get("userId") or "") or None
+        self.c_user_id = data.get("cUserId")
+        self.ssecurity = data.get("ssecurity")
+        self.pass_token = data.get("passToken")
+        await self._async_finish(data["location"])
+        if not self.pass_token:
+            raise XiaomiCloudError("QR sign-in returned no passToken")
 
     async def async_login_with_token(self, user_id: str, pass_token: str) -> None:
         """Sign in using a passToken -- no password, no challenge."""

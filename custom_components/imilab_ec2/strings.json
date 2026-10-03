@@ -5,9 +5,20 @@
         "title": "IMILAB / Mijia EC2",
         "description": "Sign in to the Xiaomi account that owns the cameras. Your gateways are then found automatically.",
         "menu_options": {
+          "qr": "Scan a QR code in the Mi Home app (recommended)",
           "credentials": "Sign in with username and password",
           "token": "Use a user ID and passToken (advanced)"
         }
+      },
+      "qr": {
+        "title": "Sign in with a QR code",
+        "description": "Pick the region the account belongs to - the same one the Mi Home app is set to. Asking the wrong region simply finds no devices.\n\nThe next screen shows a QR code. No password, captcha or verification code is needed.",
+        "data": {
+          "country": "Region"
+        }
+      },
+      "qr_scan": {
+        "title": "Scan the QR code"
       },
       "credentials": {
         "title": "Xiaomi account",
@@ -36,10 +47,11 @@
       },
       "reauth_confirm": {
         "title": "Sign in again",
-        "description": "Xiaomi has invalidated the stored token, so the cameras have stopped streaming. Signing in again restores them.",
-        "data": {
-          "username": "Xiaomi ID, email or phone number",
-          "password": "Password"
+        "description": "Xiaomi no longer accepts the stored token, so the cameras have stopped streaming. Sign in again with the account that owns them.",
+        "menu_options": {
+          "qr": "Scan a QR code in the Mi Home app (recommended)",
+          "credentials": "Sign in with username and password",
+          "token": "Use a user ID and passToken (advanced)"
         }
       },
       "captcha": {
@@ -64,7 +76,9 @@
       "captcha_required": "Xiaomi is asking for a captcha.",
       "code_required": "Xiaomi wants a verification code.",
       "invalid_code": "That code was not accepted.",
-      "code_quota": "Xiaomi will not send another verification code right now - too many have been requested. Retrying keeps the limit alive. Go back and use \"Use a user ID and passToken (advanced)\" instead: it needs no code and is not affected."
+      "code_quota": "Xiaomi will not send another verification code right now - too many have been requested. Retrying keeps the limit alive. Go back and sign in with a QR code instead: it needs no code and is not affected.",
+      "qr_expired": "The QR code expired before it was scanned. Submit again for a new one.",
+      "qr_failed": "Xiaomi did not complete the QR sign-in. Submit again for a new code."
     },
     "abort": {
       "cannot_connect": "Could not reach the Xiaomi cloud to list your devices.",
@@ -72,7 +86,11 @@
       "no_gateways": "No EC2 gateways were found on this account in the selected region. Check that you picked the right region, and that you signed in with the account that OWNS the cameras rather than one they are shared with.",
       "no_address": "The gateway has no reachable address. It must be on the same network as Home Assistant.",
       "gateway_gone": "That gateway is no longer available.",
-      "reauth_successful": "Signed in again successfully."
+      "reauth_successful": "Signed in again successfully.",
+      "wrong_account": "That is a different Xiaomi account from the one these cameras were set up with. Sign in with the account that owns them."
+    },
+    "progress": {
+      "qr_scan": "Open the **Mi Home** app signed in to the account that **owns** the cameras, tap **+** then **Scan**, and scan this code:\n\n![QR code]({qr_image})\n\nOr open [this link]({login_url}) and sign in on Xiaomi's own page.\n\nThe code is valid for about 5 minutes. This step continues on its own once you confirm."
     }
   },
   "options": {
