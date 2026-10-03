@@ -150,13 +150,21 @@ class MiioGateway:
         rather than parsed.
         """
         self._msg_id += 1
-        last_error: str = "no response"
+        last_error = f"{method}: no response"
 
         for attempt in range(ATTEMPTS):
             try:
                 data = self._exchange(method, params)
             except MiioError as err:
                 last_error = str(err)
+                _LOGGER.debug(
+                    "%s on %s: attempt %d/%d failed: %s",
+                    method,
+                    self._host,
+                    attempt + 1,
+                    ATTEMPTS,
+                    err,
+                )
                 continue
 
             try:
@@ -164,7 +172,7 @@ class MiioGateway:
                     self._decrypt(data[32:]).decode("utf-8", "replace")
                 )
             except (ValueError, UnicodeDecodeError):
-                last_error = "undecodable response"
+                last_error = f"{method}: undecodable response"
                 _LOGGER.debug(
                     "%s: attempt %d returned %d undecodable bytes",
                     method,
@@ -177,14 +185,20 @@ class MiioGateway:
                 raise MiioError(f"{method}: {decoded['error']}")
             return decoded.get("result")
 
-        raise MiioError(f"{method}: {last_error} from {self._host}")
+        raise MiioError(f"{last_error} from {self._host}")
 
     def _exchange(self, method: str, params: list[Any] | None) -> bytes:
         """One handshake-and-ask round trip; returns the raw reply packet."""
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.settimeout(TIMEOUT)
         try:
-            did, stamp = self._handshake(sock)
+            try:
+                did, stamp = self._handshake(sock)
+            except TimeoutError as err:
+                # Distinct from a silent reply below: no handshake means the
+                # gateway is not reachable at this address at all.
+                raise MiioError(f"{method}: no handshake reply") from err
+            _LOGGER.debug("%s: handshake from %s, did %s", method, self._host, did)
             started = time.time()
             payload = json.dumps(
                 {"id": self._msg_id, "method": method, "params": params or []},
@@ -225,6 +239,39 @@ class MiioGateway:
         finally:
             sock.close()
         return did
+
+    def diagnose(self, expected_did: str | int | None = None) -> str:
+        """Explain why calls fail, in one sentence, for the log.
+
+        Tells apart the three causes that all look like "no response": the
+        gateway is not there, the address belongs to a different device, or the
+        token is wrong. `miIO.info` is implemented by every miio device, so if
+        that is silent too the method is not to blame -- the token is.
+        """
+        try:
+            did = self.handshake()
+        except MiioError:
+            return (
+                f"{self._host} does not answer the miio handshake on UDP "
+                f"{MIIO_PORT}: unreachable from Home Assistant, or not this address"
+            )
+        if expected_did is not None and str(did) != str(expected_did):
+            return (
+                f"{self._host} answers as device {did}, not the gateway "
+                f"{expected_did}: the address now belongs to another device"
+            )
+        try:
+            info = self.info()
+        except MiioError as err:
+            return (
+                f"gateway {did} at {self._host} answers the handshake but not "
+                f"encrypted calls, not even miIO.info ({err}): the miio token "
+                "is not the one this gateway uses"
+            )
+        return (
+            f"gateway {did} at {self._host} accepts the token (firmware "
+            f"{info.get('fw_ver', '?')}); only this call goes unanswered"
+        )
 
     def info(self) -> dict[str, Any]:
         """`miIO.info` -- firmware, wifi AP, IP, gateway MAC."""

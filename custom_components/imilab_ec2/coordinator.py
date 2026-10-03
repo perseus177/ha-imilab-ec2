@@ -65,6 +65,7 @@ class Ec2Coordinator(DataUpdateCoordinator[dict[str, CameraInfo]]):
         host: str,
         gateway: MiioGateway | None,
         fallback: list[CameraInfo],
+        gateway_did: str | None = None,
     ) -> None:
         super().__init__(
             hass,
@@ -77,6 +78,11 @@ class Ec2Coordinator(DataUpdateCoordinator[dict[str, CameraInfo]]):
         self._gateway = gateway
         self._fallback = {camera.slug: camera for camera in fallback}
         self._warned = False
+        self._gateway_did = gateway_did
+        # Kept for the diagnostics download: the last miio failure and what
+        # `diagnose` made of it.
+        self.last_error: str | None = None
+        self.diagnosis: str | None = None
 
     @property
     def live(self) -> bool:
@@ -90,6 +96,13 @@ class Ec2Coordinator(DataUpdateCoordinator[dict[str, CameraInfo]]):
         try:
             cameras = await self.hass.async_add_executor_job(self._gateway.camera_list)
         except MiioError as err:
+            self.last_error = str(err)
+            if not self._warned:
+                # Once per outage: a few extra packets to find out WHY, so the
+                # log says more than "no response".
+                self.diagnosis = await self.hass.async_add_executor_job(
+                    self._gateway.diagnose, self._gateway_did
+                )
             if self._fallback:
                 # Streaming does not depend on this call, so degrade to the
                 # known camera list instead of taking the whole entry down.
@@ -97,17 +110,23 @@ class Ec2Coordinator(DataUpdateCoordinator[dict[str, CameraInfo]]):
                     _LOGGER.warning(
                         "Gateway stopped answering get_camera_list (%s); "
                         "keeping the configured cameras and continuing without "
-                        "sensor state. A rotated miio token is the usual cause",
+                        "sensor state. Diagnosis: %s",
                         err,
+                        self.diagnosis,
                     )
                     self._warned = True
                 return self._fallback
             # Nothing to fall back to: without the gateway's list or MACs
             # entered by hand there is no camera to stream.
+            self._warned = True
             raise UpdateFailed(
                 f"{err}. The gateway did not list its cameras and none are "
-                "configured; enter their MACs with Reconfigure"
+                f"configured; enter their MACs with Reconfigure. Diagnosis: "
+                f"{self.diagnosis}"
             ) from err
 
+        if self._warned:
+            _LOGGER.info("Gateway answers get_camera_list again")
         self._warned = False
+        self.last_error = self.diagnosis = None
         return {camera.slug: camera for camera in cameras}

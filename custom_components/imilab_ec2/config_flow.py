@@ -222,7 +222,7 @@ class Ec2ConfigFlow(ConfigFlow, domain=DOMAIN):
             try:
                 self._qr = await cloud.async_qr_start()
             except XiaomiCloudError as err:
-                _LOGGER.debug("Could not get a login QR code: %s", err)
+                _LOGGER.warning("Could not get a login QR code from Xiaomi: %s", err)
                 errors["base"] = "cannot_connect"
             else:
                 self._qr_task = None
@@ -260,7 +260,7 @@ class Ec2ConfigFlow(ConfigFlow, domain=DOMAIN):
         if isinstance(err, QrExpired):
             self._qr_error = "qr_expired"
         else:
-            _LOGGER.debug("QR sign-in failed: %s", err)
+            _LOGGER.warning("QR sign-in did not complete: %s", err)
             self._qr_error = "qr_failed"
         return self.async_show_progress_done(next_step_id="qr")
 
@@ -313,7 +313,7 @@ class Ec2ConfigFlow(ConfigFlow, domain=DOMAIN):
                     user_input[CONF_PASS_TOKEN].strip(),
                 )
             except XiaomiCloudError as err:
-                _LOGGER.debug("passToken login failed: %s", err)
+                _LOGGER.warning("Xiaomi refused the passToken: %s", err)
                 errors["base"] = "invalid_auth"
             else:
                 self._cloud = cloud
@@ -539,7 +539,7 @@ class Ec2ConfigFlow(ConfigFlow, domain=DOMAIN):
             self._last_error = "code_required"
             return None
         except XiaomiCloudError as err:
-            _LOGGER.debug("Login failed: %s", err)
+            _LOGGER.warning("Xiaomi sign-in failed: %s", err)
             self._last_error = "invalid_auth"
             return None
         return await self._async_after_login()
@@ -552,10 +552,17 @@ class Ec2ConfigFlow(ConfigFlow, domain=DOMAIN):
         try:
             self._gateways = await self._cloud.async_find_gateways(self._country)
         except XiaomiCloudError as err:
-            _LOGGER.debug("Could not list devices: %s", err)
+            _LOGGER.warning(
+                "Signed in, but could not list the account's devices: %s", err
+            )
             return self.async_abort(reason="cannot_connect")
 
         if not self._gateways:
+            _LOGGER.warning(
+                "Signed in as %s, but region %r lists no EC2 gateway",
+                self._cloud.user_id,
+                self._country,
+            )
             return self.async_abort(reason="no_gateways")
 
         # The cloud's `localip` goes stale whenever DHCP moves a device, so
@@ -584,6 +591,14 @@ class Ec2ConfigFlow(ConfigFlow, domain=DOMAIN):
         """Build the entry, discovering the cameras behind this gateway."""
         assert self._cloud is not None
         host = self._address_for(gateway)
+        _LOGGER.info(
+            "Gateway %s (%s): using %s (seen on the LAN: %s, cloud says: %s)",
+            gateway.did,
+            gateway.name,
+            host or "no address",
+            host if host and host != gateway.local_ip else "no",
+            gateway.local_ip,
+        )
         if not host:
             return self.async_abort(reason="no_address")
 
@@ -597,12 +612,17 @@ class Ec2ConfigFlow(ConfigFlow, domain=DOMAIN):
                 found = await self.hass.async_add_executor_job(client.camera_list)
             except MiioError as err:
                 # Not fatal: streaming needs the account, not this token. A
-                # rotated token costs us the sensors, not the video.
-                _LOGGER.info(
-                    "Gateway %s did not answer get_camera_list (%s); "
-                    "continuing without local camera state",
+                # silent gateway costs us the sensors, not the video. Find out
+                # why, though, so the log can say more than "no response".
+                diagnosis = await self.hass.async_add_executor_job(
+                    client.diagnose, gateway.did
+                )
+                _LOGGER.warning(
+                    "Gateway %s did not answer get_camera_list (%s); asking for "
+                    "the camera MACs instead. Diagnosis: %s",
                     host,
                     err,
+                    diagnosis,
                 )
             else:
                 cameras = [{"mac": cam.mac, "name": cam.name} for cam in found]

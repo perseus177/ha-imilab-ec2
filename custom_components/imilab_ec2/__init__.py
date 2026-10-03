@@ -53,7 +53,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: Ec2ConfigEntry) -> bool:
         static_camera(camera["mac"], camera.get("name", camera["mac"]))
         for camera in entry.data.get(CONF_CAMERAS, [])
     ]
-    coordinator = Ec2Coordinator(hass, host, gateway, fallback)
+    coordinator = Ec2Coordinator(
+        hass, host, gateway, fallback, entry.data.get(CONF_GATEWAY_DID)
+    )
     await coordinator.async_config_entry_first_refresh()
 
     # go2rtc is a singleton shared by every gateway entry: one process, one

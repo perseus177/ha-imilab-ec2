@@ -22,7 +22,9 @@ import hashlib
 import logging
 import os
 import platform
+import re
 import stat
+from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,6 +49,19 @@ _LOGGER = logging.getLogger(__name__)
 RELEASE_REPO = "perseus177/ha-imilab-ec2"
 BINARY_VERSION = "1.9.14-ec2.1"
 DOWNLOAD_TIMEOUT = 300
+# go2rtc output kept in memory for the diagnostics download and for the
+# post-mortem logged when the process dies.
+OUTPUT_LINES = 200
+POST_MORTEM_LINES = 20
+# Anything that looks like a credential is masked before a line is kept or
+# logged: Xiaomi passTokens (V1:...) and tokens/passwords in URLs.
+_SECRET = re.compile(r"V1:[A-Za-z0-9+/=_-]+|((?:token|pass\w*)=)[^&\s]+", re.IGNORECASE)
+
+
+def redact(line: str) -> str:
+    """Mask credentials in one line of go2rtc output."""
+    return _SECRET.sub(lambda m: (m.group(1) or "") + "***", line)
+
 
 # Go builds are static (CGO_ENABLED=0), so one binary per arch runs on both
 # glibc and the musl/Alpine that the HA core container uses.
@@ -118,6 +133,17 @@ class Go2rtcManager:
         self.api_listen = DEFAULT_API_LISTEN
         self.rtsp_listen = DEFAULT_RTSP_LISTEN
         self.webrtc_listen = DEFAULT_WEBRTC_LISTEN
+        self.output: deque[str] = deque(maxlen=OUTPUT_LINES)
+        self.restarts = 0
+        self.last_exit_code: int | None = None
+
+    @property
+    def pid(self) -> int | None:
+        """The running process, or None."""
+        process = self._process
+        if process is None or process.returncode is not None:
+            return None
+        return process.pid
 
     # -- paths ----------------------------------------------------------------
 
@@ -282,8 +308,13 @@ class Go2rtcManager:
             if self._stopping:
                 return
             delay = RESTART_BACKOFF[min(attempt, len(RESTART_BACKOFF) - 1)]
+            self.last_exit_code = code
+            self.restarts += 1
             _LOGGER.warning(
-                "go2rtc exited with code %s, restarting in %ss", code, delay
+                "go2rtc exited with code %s, restarting in %ss. Its last output:\n%s",
+                code,
+                delay,
+                "\n".join(list(self.output)[-POST_MORTEM_LINES:]) or "(none)",
             )
             await asyncio.sleep(delay)
             attempt += 1
@@ -305,14 +336,17 @@ class Go2rtcManager:
         if process.stdout is None:
             return
         async for raw in process.stdout:
-            line = raw.decode("utf-8", "replace").rstrip()
+            line = redact(raw.decode("utf-8", "replace").rstrip())
             if not line:
                 continue
+            self.output.append(line)
             if "401" in line and "nauthorized" in line:
-                _LOGGER.debug("go2rtc reported an auth failure: %s", line)
+                _LOGGER.warning("go2rtc: Xiaomi cloud refused the account: %s", line)
                 if self.on_auth_failure is not None:
                     self._hass.async_create_task(self.on_auth_failure())
-            elif "ERR" in line or "error" in line:
+            elif " ERR " in line or " WRN " in line or "error" in line:
+                # WRN carries the stream failures (EOF, timeouts) that explain
+                # "the camera did not open"; at debug they were invisible.
                 _LOGGER.warning("go2rtc: %s", line)
             else:
                 _LOGGER.debug("go2rtc: %s", line)
