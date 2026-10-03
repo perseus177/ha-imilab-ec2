@@ -104,6 +104,25 @@ ports serves nothing. Home Assistant's own bundled go2rtc (`127.0.0.1:11984`,
 `:18554`) does not collide either. All three ports can be changed under
 **Configure** on the integration entry.
 
+## Internet outages
+
+Every connection starts with a cloud call: the cloud signs the client key and
+the gateway admits only a signed client. The video itself flows over the LAN.
+Measured on a real gateway, that signature is **not single-use**: it keeps
+opening the camera until the gateway rotates its own key, which it does
+every so often (seen unchanged for 48 minutes, changed between days).
+
+So the bundled go2rtc keeps the last credentials the cloud issued for each
+gateway and uses them when the cloud cannot be reached, and remembers them
+across restarts. Cameras therefore survive an internet outage for as long as
+the gateway keeps its key. They do **not** work without internet
+indefinitely; only the cloud can sign a new key.
+
+The gateway device has a diagnostic sensor **P2P key since**: the time the
+gateway started presenting its current key. Its history shows how often the
+key rotates, which is how long the cameras would last offline. The log says
+the same at INFO level (`P2P key rotated ... was in use for between ...`).
+
 ## Things that are the hardware, not bugs
 
 * **Cold start is roughly 16–20 seconds.** Waking a battery camera and

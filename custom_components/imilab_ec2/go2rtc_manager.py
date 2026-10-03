@@ -28,16 +28,21 @@ from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
+from urllib.parse import parse_qs
 
 import aiohttp
 import yaml
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.dispatcher import async_dispatcher_send
+from homeassistant.util import dt as dt_util
 
 from .const import (
     DEFAULT_API_LISTEN,
     DEFAULT_RTSP_LISTEN,
     DEFAULT_WEBRTC_LISTEN,
+    DOMAIN,
     GATEWAY_MODEL,
     QUALITY_LABELS,
     STREAM_QUALITIES,
@@ -47,15 +52,26 @@ _LOGGER = logging.getLogger(__name__)
 
 # Our own release, not AlexxIT's. Pinned on purpose.
 RELEASE_REPO = "perseus177/ha-imilab-ec2"
-BINARY_VERSION = "1.9.14-ec2.1"
+BINARY_VERSION = "1.9.14-ec2.2"
 DOWNLOAD_TIMEOUT = 300
 # go2rtc output kept in memory for the diagnostics download and for the
 # post-mortem logged when the process dies.
 OUTPUT_LINES = 200
 POST_MORTEM_LINES = 20
 # Anything that looks like a credential is masked before a line is kept or
-# logged: Xiaomi passTokens (V1:...) and tokens/passwords in URLs.
-_SECRET = re.compile(r"V1:[A-Za-z0-9+/=_-]+|((?:token|pass\w*)=)[^&\s]+", re.IGNORECASE)
+# logged: Xiaomi passTokens (V1:...), tokens/passwords in URLs, and the P2P
+# client key and cloud signature that a dial URL carries.
+_SECRET = re.compile(
+    r"V1:[A-Za-z0-9+/=_-]+|((?:token|pass\w*|client_private|sign)=)[^&\s]+",
+    re.IGNORECASE,
+)
+# Each `xiaomi: dial` line names the gateway (did) and the key it presented
+# (device_public); a line about reused credentials precedes a dial that went
+# without the cloud.
+_DIAL = re.compile(r"xiaomi: dial xiaomi://(?:[^@\s]*@)?[^\s?]+\?(\S+)")
+_REUSE = re.compile(r"reusing P2P credentials for did=(\d+)")
+# Fired with the did whenever a gateway's P2P key state changes.
+SIGNAL_P2P = f"{DOMAIN}_p2p_key"
 
 
 def redact(line: str) -> str:
@@ -74,6 +90,19 @@ ARCH_MAP = {
 }
 
 RESTART_BACKOFF = (1, 2, 5, 10, 30, 60)
+
+
+def _human(seconds: float) -> str:
+    """Seconds as `1d 2h 03m` for the log."""
+    total = int(seconds)
+    days, rest = divmod(total, 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes = rest // 60
+    if days:
+        return f"{days}d {hours}h {minutes:02d}m"
+    if hours:
+        return f"{hours}h {minutes:02d}m"
+    return f"{minutes}m {rest % 60:02d}s"
 
 
 class Go2rtcError(Exception):
@@ -136,6 +165,13 @@ class Go2rtcManager:
         self.output: deque[str] = deque(maxlen=OUTPUT_LINES)
         self.restarts = 0
         self.last_exit_code: int | None = None
+        # Per gateway did: the P2P key it currently presents and how long it
+        # has, so the key's lifetime can be read off the log and a sensor.
+        # The cloud signs our client key against this device key, and the
+        # signature stays usable until the key changes -- which is how long
+        # the cameras survive without internet.
+        self.p2p: dict[str, dict[str, Any]] = {}
+        self._reuse_pending: set[str] = set()
 
     @property
     def pid(self) -> int | None:
@@ -336,9 +372,11 @@ class Go2rtcManager:
         if process.stdout is None:
             return
         async for raw in process.stdout:
-            line = redact(raw.decode("utf-8", "replace").rstrip())
-            if not line:
+            raw_line = raw.decode("utf-8", "replace").rstrip()
+            if not raw_line:
                 continue
+            self._track_p2p(raw_line)
+            line = redact(raw_line)
             self.output.append(line)
             if "401" in line and "nauthorized" in line:
                 _LOGGER.warning("go2rtc: Xiaomi cloud refused the account: %s", line)
@@ -350,6 +388,72 @@ class Go2rtcManager:
                 _LOGGER.warning("go2rtc: %s", line)
             else:
                 _LOGGER.debug("go2rtc: %s", line)
+
+    def _track_p2p(self, line: str) -> None:
+        """Follow each gateway's P2P key across dials.
+
+        A key change is only ever noticed at the next connection, so the
+        previous key's lifetime is known as a range: at least until it was
+        last seen, at most until the new one appeared.
+        """
+        if match := _REUSE.search(line):
+            self._reuse_pending.add(match.group(1))
+            return
+        match = _DIAL.search(line)
+        if match is None:
+            return
+        query = parse_qs(match.group(1))
+        did = (query.get("did") or [""])[0]
+        key = (query.get("device_public") or [""])[0]
+        if not did or not key:
+            return
+
+        now = dt_util.utcnow()
+        cached = did in self._reuse_pending
+        self._reuse_pending.discard(did)
+        fingerprint = key[:12]
+        state = self.p2p.get(did)
+
+        if state is None:
+            _LOGGER.info("Gateway %s: P2P key %s first seen", did, fingerprint)
+            state = {
+                "key": fingerprint,
+                "since": now,
+                "connections": 0,
+                "cached_connections": 0,
+                "rotations": 0,
+                "previous_lifetime_min": None,
+                "previous_lifetime_max": None,
+            }
+        elif state["key"] != fingerprint:
+            at_least = (state["last_seen"] - state["since"]).total_seconds()
+            at_most = (now - state["since"]).total_seconds()
+            _LOGGER.info(
+                "Gateway %s: P2P key rotated to %s. The previous key %s was in "
+                "use for between %s and %s, over %d connection(s)",
+                did,
+                fingerprint,
+                state["key"],
+                _human(at_least),
+                _human(at_most),
+                state["connections"],
+            )
+            state = {
+                "key": fingerprint,
+                "since": now,
+                "connections": 0,
+                "cached_connections": 0,
+                "rotations": state["rotations"] + 1,
+                "previous_lifetime_min": at_least,
+                "previous_lifetime_max": at_most,
+            }
+
+        state["last_seen"] = now
+        state["connections"] += 1
+        if cached:
+            state["cached_connections"] += 1
+        self.p2p[did] = state
+        async_dispatcher_send(self._hass, SIGNAL_P2P, did)
 
     async def async_stop(self) -> None:
         """Stop go2rtc and its supervisor."""

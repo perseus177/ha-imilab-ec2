@@ -133,6 +133,9 @@
       },
       "last_motion": {
         "name": "Last motion"
+      },
+      "p2p_key_since": {
+        "name": "P2P key since"
       }
     }
   }

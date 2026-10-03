@@ -20,13 +20,16 @@ from homeassistant.components.sensor import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import PERCENTAGE, EntityCategory
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .camera import camera_device_info
+from .const import CONF_GATEWAY_DID, DOMAIN, GATEWAY_MODEL
 from .coordinator import Ec2Coordinator, Ec2RuntimeData
+from .go2rtc_manager import SIGNAL_P2P
 from .miio import CameraInfo
 
 
@@ -77,7 +80,7 @@ async def async_setup_entry(
 ) -> None:
     data: Ec2RuntimeData = entry.runtime_data
     slugs = list(data.coordinator.data)
-    entities = [
+    entities: list[SensorEntity] = [
         Ec2Sensor(data, slug, description)
         for slug in slugs
         for description in SENSORS
@@ -85,7 +88,73 @@ async def async_setup_entry(
         # pinned on a camera only when there is just one.
         if description.key != "last_motion" or len(slugs) == 1
     ]
+    entities.append(
+        Ec2GatewayKeySensor(data, entry.title, str(entry.data[CONF_GATEWAY_DID]))
+    )
     async_add_entities(entities)
+
+
+class Ec2GatewayKeySensor(SensorEntity):
+    """Since when the gateway has presented its current P2P key.
+
+    The cloud signs our client key against the gateway's key, and that
+    signature keeps opening the camera -- with or without internet -- until
+    the gateway rotates the key. So the age of the key is how long the
+    cameras would survive an internet outage, and the history of this sensor
+    is the record of how often the key changes.
+    """
+
+    _attr_has_entity_name = True
+    _attr_translation_key = "p2p_key_since"
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_should_poll = False
+
+    def __init__(self, data: Ec2RuntimeData, title: str, did: str) -> None:
+        self._data = data
+        self._did = did
+        self._attr_unique_id = f"{data.gateway_id}_p2p_key_since"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, data.gateway_id)},
+            name=f"{title} gateway",
+            manufacturer="IMILAB / Xiaomi",
+            model="EC2 gateway",
+            model_id=GATEWAY_MODEL,
+        )
+
+    async def async_added_to_hass(self) -> None:
+        @callback
+        def _changed(did: str) -> None:
+            if did == self._did:
+                self.async_write_ha_state()
+
+        self.async_on_remove(async_dispatcher_connect(self.hass, SIGNAL_P2P, _changed))
+
+    @property
+    def _state(self) -> dict[str, Any] | None:
+        return self._data.go2rtc.p2p.get(self._did)
+
+    @property
+    def available(self) -> bool:
+        # Nothing to say until the first connection shows us a key.
+        return self._state is not None
+
+    @property
+    def native_value(self) -> datetime | None:
+        state = self._state
+        return state["since"] if state else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        state = self._state or {}
+        return {
+            "key": state.get("key"),
+            "connections_with_this_key": state.get("connections"),
+            "connections_without_cloud": state.get("cached_connections"),
+            "key_rotations_seen": state.get("rotations"),
+            "previous_key_lifetime_min_s": state.get("previous_lifetime_min"),
+            "previous_key_lifetime_max_s": state.get("previous_lifetime_max"),
+        }
 
 
 class Ec2Sensor(CoordinatorEntity[Ec2Coordinator], SensorEntity):

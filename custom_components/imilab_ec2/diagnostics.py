@@ -72,6 +72,13 @@ async def async_get_config_entry_diagnostics(
         # Already redacted as it was read.
         "output": list(manager.output),
     }
+    data["p2p_keys"] = {
+        did: {
+            key: value.isoformat() if hasattr(value, "isoformat") else value
+            for key, value in state.items()
+        }
+        for did, state in manager.p2p.items()
+    }
     renewer = runtime.renewer
     data["account"] = {
         "needs_user": getattr(renewer, "needs_user", None),
