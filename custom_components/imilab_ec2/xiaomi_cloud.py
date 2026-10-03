@@ -599,7 +599,10 @@ class XiaomiCloud:
                     except ValueError:
                         pass
         except (aiohttp.ClientError, TimeoutError) as err:
-            raise XiaomiCloudError(f"could not complete sign-in: {err}") from err
+            # Some aiohttp errors stringify to nothing; name the class then.
+            raise XiaomiCloudError(
+                f"could not complete sign-in: {err or type(err).__name__}"
+            ) from err
 
         if not self._service_token:
             raise XiaomiCloudError("sign-in did not yield a serviceToken")

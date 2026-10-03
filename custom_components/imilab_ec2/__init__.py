@@ -205,6 +205,7 @@ async def _async_rebuild_go2rtc(
         )
 
     await manager.async_write_config(accounts, streams)
+    await manager.async_apply(accounts, streams)
 
 
 def host_ip_for_players(hass: HomeAssistant, gateway_host: str) -> str:

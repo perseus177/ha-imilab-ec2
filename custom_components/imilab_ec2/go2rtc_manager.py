@@ -176,6 +176,11 @@ class Go2rtcManager:
         # the cameras survive without internet.
         self.p2p: dict[str, dict[str, Any]] = {}
         self._reuse_pending: set[str] = set()
+        # Accounts in the config as last written, and as the running process
+        # read them at start. go2rtc takes account tokens only from its config
+        # at start, so a new account needs a restart; streams it takes live.
+        self._config_accounts: set[str] = set()
+        self.running_accounts: set[str] = set()
 
     @property
     def pid(self) -> int | None:
@@ -282,6 +287,7 @@ class Go2rtcManager:
         self, accounts: dict[str, str], streams: list[StreamSpec]
     ) -> None:
         """Render go2rtc.yaml from the entries we manage."""
+        self._config_accounts = set(accounts)
         config = {
             "api": {"listen": self.api_listen},
             "rtsp": {"listen": self.rtsp_listen},
@@ -334,7 +340,60 @@ class Go2rtcManager:
                 "If this is a permission error, check that the config directory "
                 "is not mounted noexec."
             ) from err
+        self.running_accounts = set(self._config_accounts)
         _LOGGER.info("go2rtc started (pid %s)", self._process.pid)
+
+    async def async_apply(
+        self, accounts: dict[str, str], streams: list[StreamSpec]
+    ) -> None:
+        """Make the running process serve what the config now says.
+
+        go2rtc reads its config only at start. A gateway added while it runs
+        used to end up in the file and nowhere else: Home Assistant asked for
+        a stream the process had never heard of, and the camera never dialled.
+        Streams are added and removed live through the API, so the cameras
+        already streaming are not interrupted; a new account's token can only
+        be read at start, so that case restarts the process.
+        """
+        if self.pid is None:
+            return  # async_start will read the file
+        if set(accounts) != self.running_accounts:
+            _LOGGER.info("go2rtc restarting to pick up a new Xiaomi account")
+            await self.async_stop()
+            await self.async_start()
+            return
+        await self._async_sync_streams(streams)
+
+    async def _async_sync_streams(self, streams: list[StreamSpec]) -> None:
+        port = self.api_listen.rsplit(":", 1)[-1]
+        base = f"http://127.0.0.1:{port}/api/streams"
+        session = async_get_clientsession(self._hass)
+        timeout = aiohttp.ClientTimeout(total=10)
+        wanted = {spec.name: spec.url for spec in streams}
+        try:
+            async with session.get(base, timeout=timeout) as response:
+                current = (
+                    await response.json(content_type=None)
+                    if response.status == 200
+                    else {}
+                )
+            if not isinstance(current, dict):
+                current = {}
+            for name, url in wanted.items():
+                producers = (current.get(name) or {}).get("producers") or []
+                if any(isinstance(p, dict) and p.get("url") == url for p in producers):
+                    continue
+                async with session.put(
+                    base, params={"name": name, "src": url}, timeout=timeout
+                ):
+                    pass
+                _LOGGER.info("go2rtc: stream %s added", name)
+            for name in set(current) - set(wanted):
+                async with session.delete(base, params={"src": name}, timeout=timeout):
+                    pass
+                _LOGGER.info("go2rtc: stream %s removed", name)
+        except (aiohttp.ClientError, TimeoutError) as err:
+            raise Go2rtcError(f"go2rtc API: {err}") from err
 
     async def _async_supervise(self) -> None:
         """Restart go2rtc if it dies, with backoff, until we ask it to stop."""
