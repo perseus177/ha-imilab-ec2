@@ -201,6 +201,7 @@ async def _async_rebuild_go2rtc(
                 gateway_host=entry.data[CONF_GATEWAY_HOST],
                 gateway_did=entry.data[CONF_GATEWAY_DID],
                 cameras=list(data.coordinator.data.values()),
+                region=entry.data.get("country", ""),
             )
         )
 
