@@ -226,8 +226,10 @@ class Ec2Coordinator(DataUpdateCoordinator[dict[str, CameraInfo]]):
         cameras = await self._async_local()
         if cameras is None:
             cameras = await self._async_cloud_list()
-        if cameras is None and self._last_live_at is not None and (
-            time.monotonic() - self._last_live_at < STALE_GRACE
+        if (
+            cameras is None
+            and self._last_live_at is not None
+            and (time.monotonic() - self._last_live_at < STALE_GRACE)
         ):
             # A short cloud outage: the battery level does not change in a
             # few minutes, so keep showing the last reading rather than
