@@ -123,7 +123,7 @@ class StreamSpec:
 
 
 def build_streams(
-    user_id: str, gateway_host: str, gateway_did: int, cameras: list
+    user_id: str, gateway_host: str, gateway_did: int, cameras: list, region: str = ""
 ) -> list[StreamSpec]:
     """Build the go2rtc stream list for every camera at every quality.
 
@@ -139,7 +139,7 @@ def build_streams(
                     name=f"{camera.slug}{suffix}",
                     label=f"{camera.name} {QUALITY_LABELS[suffix]}".strip(),
                     url=(
-                        f"xiaomi://{user_id}:@{gateway_host}"
+                        f"xiaomi://{user_id}:{region}@{gateway_host}"
                         f"?did={gateway_did}"
                         f"&model={GATEWAY_MODEL}"
                         f"&mac={camera.mac}"
