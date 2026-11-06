@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
@@ -35,6 +36,7 @@ from .const import (
     FAST_INTERVAL,
     GATEWAY_MODEL,
     LOCAL_RETRY_INTERVAL,
+    STALE_GRACE,
 )
 from .go2rtc_manager import Go2rtcManager
 from .miio import CameraInfo, MiioError, MiioGateway
@@ -51,6 +53,8 @@ class Ec2RuntimeData:
     go2rtc: Go2rtcManager
     gateway_id: str
     lan_host: str
+    # The gateway's device registry id, which the cameras link to.
+    gateway_device_id: str | None = None
     # Set during setup; keeps the Xiaomi session alive on its own.
     renewer: Any = None
 
@@ -117,14 +121,19 @@ class CloudSource:
         self._cloud: XiaomiCloud | None = None
 
     async def _async_call(self, func):
-        """Run `func(cloud)`, signing in first and once more if it is refused."""
+        """Run `func(cloud)`, signing in first and once more if it is refused.
+
+        The sign-in is inside the retry too: Xiaomi's login hosts drop the odd
+        request (TLS handshake timeouts, an empty reply), and one such blip
+        should not cost a poll.
+        """
         for attempt in range(2):
-            if self._cloud is None:
-                cloud = self._factory()
-                user_id, pass_token = self._credentials()
-                await cloud.async_login_with_token(user_id, pass_token)
-                self._cloud = cloud
             try:
+                if self._cloud is None:
+                    cloud = self._factory()
+                    user_id, pass_token = self._credentials()
+                    await cloud.async_login_with_token(user_id, pass_token)
+                    self._cloud = cloud
                 return await func(self._cloud)
             except XiaomiCloudError:
                 # A stale session looks like any other refusal; start over
@@ -170,10 +179,12 @@ class Ec2Coordinator(DataUpdateCoordinator[dict[str, CameraInfo]]):
         gateway_did: str | None = None,
         cloud: CloudSource | None = None,
         gateway_name: str = "EC2",
+        config_entry: ConfigEntry | None = None,
     ) -> None:
         super().__init__(
             hass,
             _LOGGER,
+            config_entry=config_entry,
             name=f"{DOMAIN} {host}",
             update_interval=timedelta(seconds=FAST_INTERVAL)
             if gateway
@@ -187,6 +198,8 @@ class Ec2Coordinator(DataUpdateCoordinator[dict[str, CameraInfo]]):
         self._gateway_did = gateway_did
         self.gateway_name = gateway_name
         self._local_retry_at = 0.0
+        # When the gateway's state was last read for real (local or cloud).
+        self._last_live_at: float | None = None
         self._warned_local = False
         self._warned_cloud = False
         self._warned_event = False
@@ -213,7 +226,16 @@ class Ec2Coordinator(DataUpdateCoordinator[dict[str, CameraInfo]]):
         cameras = await self._async_local()
         if cameras is None:
             cameras = await self._async_cloud_list()
-        if cameras is None:
+        if cameras is None and self._last_live_at is not None and (
+            time.monotonic() - self._last_live_at < STALE_GRACE
+        ):
+            # A short cloud outage: the battery level does not change in a
+            # few minutes, so keep showing the last reading rather than
+            # flapping every sensor to unavailable.
+            return self.data
+        if cameras is not None:
+            self._last_live_at = time.monotonic()
+        else:
             if not self._fallback:
                 raise UpdateFailed(
                     "The gateway did not list its cameras, locally "
@@ -283,8 +305,10 @@ class Ec2Coordinator(DataUpdateCoordinator[dict[str, CameraInfo]]):
             if not self._warned_cloud:
                 _LOGGER.warning(
                     "The cloud could not list the gateway's cameras either: %s; "
-                    "sensors stay unavailable",
+                    "keeping the last reading, if any, for up to %d min, then the "
+                    "sensors go unavailable",
                     err,
+                    STALE_GRACE // 60,
                 )
                 self._warned_cloud = True
             return None

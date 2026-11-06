@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from homeassistant.config_entries import ConfigEntry
@@ -77,6 +77,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: Ec2ConfigEntry) -> bool:
         gateway_did=entry.data.get(CONF_GATEWAY_DID),
         cloud=cloud,
         gateway_name=entry.title,
+        config_entry=entry,
     )
     await coordinator.async_config_entry_first_refresh()
 
@@ -90,7 +91,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: Ec2ConfigEntry) -> bool:
     gateway_id = f"gateway_{entry.data[CONF_GATEWAY_DID]}"
     # The cameras hang off the gateway (`via_device`), so the gateway has to
     # exist first; Home Assistant refuses a link to a device it does not know.
-    dr.async_get(hass).async_get_or_create(
+    gateway_device = dr.async_get(hass).async_get_or_create(
         config_entry_id=entry.entry_id,
         identifiers={(DOMAIN, gateway_id)},
         # "gateway" in the name and the model, so it is never mistaken for the
@@ -106,6 +107,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: Ec2ConfigEntry) -> bool:
         go2rtc=manager,
         gateway_id=gateway_id,
         lan_host=host_ip_for_players(hass, host),
+        gateway_device_id=gateway_device.id,
     )
 
     # Renew the account token by ourselves whenever it goes stale, the way the
@@ -128,11 +130,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: Ec2ConfigEntry) -> bool:
     except Go2rtcError as err:
         raise ConfigEntryNotReady(f"streaming backend unavailable: {err}") from err
 
-    # Catch a rotation before anybody notices the cameras are dark.
+    # Catch a rotation before anybody notices the cameras are dark. A
+    # coroutine function, not a lambda: Home Assistant runs a plain function
+    # that is not marked @callback in a worker thread, and creating a task
+    # from there is not allowed.
+    async def _async_periodic_token_check(_now: datetime) -> None:
+        await renewer.async_check()
+
     entry.async_on_unload(
         async_track_time_interval(
             hass,
-            lambda _now: hass.async_create_task(renewer.async_check()),
+            _async_periodic_token_check,
             timedelta(seconds=TOKEN_CHECK_INTERVAL),
         )
     )

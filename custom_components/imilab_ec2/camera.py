@@ -49,6 +49,11 @@ from .miio import CameraInfo
 
 _LOGGER = logging.getLogger(__name__)
 
+_DEVICE_INFO_HAS_VIA_ID = "via_device_id" in (
+    getattr(DeviceInfo, "__required_keys__", frozenset())
+    | getattr(DeviceInfo, "__optional_keys__", frozenset())
+)
+
 SNAPSHOT_TIMEOUT = 10
 # After go2rtc dials the camera for a viewer, try to grab a frame at these
 # offsets (seconds). The first ~16-20 s go on waking the camera and the P2P
@@ -79,15 +84,21 @@ def camera_device_info(
     data: Ec2RuntimeData, slug: str, camera: CameraInfo | None
 ) -> DeviceInfo:
     """The camera's device, shared by its camera and sensor entities."""
-    return DeviceInfo(
+    info = DeviceInfo(
         identifiers={(DOMAIN, slug)},
         name=data.coordinator.name_for(slug),
         manufacturer="IMILAB / Xiaomi",
         model="EC2 camera",
         model_id="CMSXJ11A",
         sw_version=camera.version if camera else None,
-        via_device=(DOMAIN, data.gateway_id),
     )
+    # Home Assistant 2026.8 links devices by registry id and deprecates the
+    # identifier tuple (removed in 2027.8); older versions only know the tuple.
+    if _DEVICE_INFO_HAS_VIA_ID and data.gateway_device_id:
+        info["via_device_id"] = data.gateway_device_id
+    else:
+        info["via_device"] = (DOMAIN, data.gateway_id)
+    return info
 
 
 @dataclass(frozen=True)

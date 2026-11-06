@@ -60,6 +60,9 @@ SLOW_INTERVAL: Final = 900
 # every half hour, since each failed attempt costs ~20 s of timeouts.
 CLOUD_INTERVAL: Final = 60
 LOCAL_RETRY_INTERVAL: Final = 1800
+# When neither source answers, the last real reading is kept this long before
+# the sensors go unavailable -- a Xiaomi login blip should not flap them.
+STALE_GRACE: Final = 900
 # How far back to look for the last motion event.
 EVENT_LOOKBACK_DAYS: Final = 7
 
